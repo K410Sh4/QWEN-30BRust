@@ -47,16 +47,24 @@ struct Compute {
     /// Diagnostic: allocate fresh weight buffers on cache misses.
     #[arg(long)]
     no_weight_reuse: bool,
+    /// Measure resident Vulkan stages with host timers and supported GPU timestamp queries.
+    #[arg(long)]
+    profile: bool,
 }
 impl Compute {
     fn backend(&self) -> Result<Box<dyn Backend>> {
+        ensure!(
+            !self.profile || matches!(self.device, Device::Vulkan) && !self.vulkan_reference,
+            "--profile requires the resident Vulkan graph"
+        );
         Ok(match self.device {
             Device::Cpu => Box::new(Cpu::default()),
             Device::Vulkan => {
-                let v = Vulkan::new(
+                let v = Vulkan::new_with_profile(
                     self.gpu_cache_mib,
                     self.adapter.as_deref(),
                     self.allow_software,
+                    self.profile,
                 )?
                 .reference(self.vulkan_reference)
                 .kv_budget_mib(self.gpu_kv_mib)?

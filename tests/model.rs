@@ -264,3 +264,43 @@ fn resident_attention_longer_than_one_workgroup() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires Vulkan; checks GPU stage profiling and logits parity"]
+fn stage_profiling_preserves_logits_and_inference_counters() {
+    use qwen_rust::{
+        backend::{Backend, Vulkan},
+        benchmark::delta,
+    };
+
+    let allow = std::env::var("QWEN_TEST_ALLOW_SOFTWARE").as_deref() == Ok("1");
+    let mut gpu = Vulkan::new_with_profile(1, None, allow, true).unwrap();
+    let mut model = Model::new(Gguf::open(&fixture()).unwrap(), 8).unwrap();
+    let expected: Vec<Vec<f32>> =
+        serde_json::from_str(include_str!("data/expected-logits.json")).unwrap();
+
+    model.forward_without_logits(1, &mut gpu).unwrap();
+    let prefill = gpu.stats().clone();
+    let actual = model.forward(5, &mut gpu).unwrap();
+    for (a, b) in actual.iter().zip(&expected[1]) {
+        assert!((a - b).abs() < 2e-5);
+    }
+    let step = delta(gpu.stats(), &prefill);
+    assert_eq!(step.submissions, model.config.layers as u64 + 1);
+    assert_eq!(step.readbacks, step.submissions);
+    let profile = step.profile.unwrap();
+    assert!(profile.expert_bank_copy_bytes > 0);
+    assert!(profile.expert_uploaded_bytes <= step.uploaded_bytes);
+    let prefill_profile = prefill.profile.unwrap();
+    assert_eq!(prefill_profile.gpu_logits_ms, 0.);
+    assert_eq!(prefill_profile.host_logits_wait_ms, 0.);
+    if gpu.metadata()["gpu_timestamp_query"] == true {
+        assert_eq!(prefill_profile.gpu_timestamp_steps, 1);
+        assert_eq!(profile.gpu_timestamp_steps, 1);
+        assert!(profile.gpu_attention_ms > 0.);
+        assert!(profile.gpu_experts_ms > 0.);
+        assert!(profile.gpu_logits_ms > 0.);
+    } else {
+        assert_eq!(profile.gpu_timestamp_steps, 0);
+    }
+}

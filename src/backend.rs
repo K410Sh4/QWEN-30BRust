@@ -1,4 +1,10 @@
-use crate::{gguf::Gguf, model::Config, quant};
+pub use crate::gpu_profile::ProfileStats;
+use crate::{
+    gguf::Gguf,
+    gpu_profile::GpuProfile,
+    model::Config,
+    quant,
+};
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use std::{
@@ -28,6 +34,8 @@ pub struct Stats {
     pub weight_buffer_reuses: u64,
     pub weight_prepare_ms: f64,
     pub gpu_readback_wait_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileStats>,
 }
 pub trait Backend {
     fn matvec(
@@ -129,6 +137,7 @@ pub struct Vulkan {
     lru: BinaryHeap<Reverse<(u64, (usize, usize))>>,
     pub(crate) graph: Option<crate::gpu_graph::Graph>,
     pub(crate) graph_enabled: bool,
+    pub(crate) gpu_profile: Option<GpuProfile>,
     pub(crate) kv_budget: u64,
     submitted_epoch: u64,
     completed_epoch: u64,
@@ -136,6 +145,15 @@ pub struct Vulkan {
 }
 impl Vulkan {
     pub fn new(budget_mib: u64, filter: Option<&str>, allow_software: bool) -> Result<Self> {
+        Self::new_with_profile(budget_mib, filter, allow_software, false)
+    }
+
+    pub fn new_with_profile(
+        budget_mib: u64,
+        filter: Option<&str>,
+        allow_software: bool,
+        profile: bool,
+    ) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
@@ -164,10 +182,16 @@ impl Vulkan {
             limits.max_compute_workgroups_per_dimension >= 65535,
             "Vulkan grid limit too small"
         );
+        let timestamp_query = wgpu::Features::TIMESTAMP_QUERY;
+        let features = if profile && adapter.features().contains(timestamp_query) {
+            timestamp_query
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("qwen-rust"),
-                required_features: wgpu::Features::empty(),
+                required_features: features,
                 required_limits: limits,
             },
             None,
@@ -196,13 +220,17 @@ impl Vulkan {
                 .context("cache budget overflow")?,
             used: 0,
             clock: 0,
-            stats: Stats::default(),
+            stats: Stats {
+                profile: profile.then(ProfileStats::default),
+                ..Default::default()
+            },
             adapter_name: info.name,
             software: info.device_type == wgpu::DeviceType::Cpu,
             active_model: 0,
             lru: BinaryHeap::new(),
             graph: None,
             graph_enabled: true,
+            gpu_profile: None,
             kv_budget: 1024 * 1024 * 1024,
             submitted_epoch: 0,
             completed_epoch: 0,
@@ -384,7 +412,11 @@ impl Vulkan {
         Ok(buffer)
     }
     pub(crate) fn submit_commands(&mut self, encoder: wgpu::CommandEncoder) {
+        let started = self.stats.profile.as_ref().map(|_| Instant::now());
         self.queue.submit(Some(encoder.finish()));
+        if let (Some(profile), Some(started)) = (&mut self.stats.profile, started) {
+            profile.host_submit_ms += started.elapsed().as_secs_f64() * 1000.;
+        }
         self.submitted_epoch += 1;
         self.stats.submissions += 1;
     }
@@ -543,7 +575,14 @@ impl Backend for Vulkan {
                 pos == 0,
                 "reset the model before changing Vulkan execution mode/context"
             );
+            let started = self.stats.profile.as_ref().map(|_| Instant::now());
+            if self.device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+                self.gpu_profile = Some(GpuProfile::new(&self.device, &self.queue, c.layers)?);
+            }
             self.graph = Some(crate::gpu_graph::Graph::new(self, m, c, context)?);
+            if let (Some(profile), Some(started)) = (&mut self.stats.profile, started) {
+                profile.host_graph_init_ms += started.elapsed().as_secs_f64() * 1000.;
+            }
         }
         let mut graph = self.graph.take().unwrap();
         let result = graph.forward(self, m, c, token, pos, logits);
@@ -554,7 +593,12 @@ impl Backend for Vulkan {
         self.graph_enabled
     }
     fn metadata(&self) -> serde_json::Value {
-        serde_json::json!({"backend":"vulkan","adapter":self.adapter_name,"software":self.software,"resident":self.graph_enabled,"weight_cache_budget_bytes":self.budget,"kv_budget_bytes":self.kv_budget,"weight_buffer_reuse":self.reuse_weights})
+        let mut metadata = serde_json::json!({"backend":"vulkan","adapter":self.adapter_name,"software":self.software,"resident":self.graph_enabled,"weight_cache_budget_bytes":self.budget,"kv_budget_bytes":self.kv_budget,"weight_buffer_reuse":self.reuse_weights});
+        if self.stats.profile.is_some() {
+            metadata["gpu_timestamp_query"] =
+                self.device.features().contains(wgpu::Features::TIMESTAMP_QUERY).into();
+        }
+        metadata
     }
     fn stats(&self) -> &Stats {
         &self.stats

@@ -4,6 +4,7 @@
 use crate::{
     backend::{matrix, Vulkan},
     gguf::Gguf,
+    gpu_profile::Stage,
     model::Config,
     ops, quant,
 };
@@ -343,8 +344,23 @@ impl Graph {
     fn submit(v: &mut Vulkan, e: wgpu::CommandEncoder) {
         v.submit_commands(e);
     }
-    fn read(v: &mut Vulkan, b: &wgpu::Buffer) -> Result<Vec<f32>> {
-        v.read_buffer(b)
+    fn profile_begin(v: &Vulkan, encoder: &mut wgpu::CommandEncoder) {
+        if let Some(profile) = &v.gpu_profile {
+            profile.begin(encoder);
+        }
+    }
+    fn profile_end(v: &mut Vulkan, encoder: &mut wgpu::CommandEncoder, stage: Stage) {
+        if let Some(profile) = &mut v.gpu_profile {
+            profile.end(encoder, stage);
+        }
+    }
+    fn collect_profile(v: &mut Vulkan) -> Result<()> {
+        if let (Some(gpu), Some(profile)) = (&v.gpu_profile, &mut v.stats.profile) {
+            let started = Instant::now();
+            gpu.collect(&v.device, profile)?;
+            profile.host_profile_read_ms += started.elapsed().as_secs_f64() * 1000.;
+        }
+        Ok(())
     }
     pub fn forward(
         &mut self,
@@ -360,6 +376,9 @@ impl Graph {
             pos == 0 || pos == self.position,
             "GPU cache position mismatch; reset model before switching backends"
         );
+        if let Some(profile) = &mut v.gpu_profile {
+            profile.reset();
+        }
         let frame = [
             c.hidden as u32,
             c.heads as u32,
@@ -390,6 +409,7 @@ impl Graph {
             });
         for i in 0..c.layers {
             let base = format!("blk.{i}");
+            Self::profile_begin(v, &mut e);
             self.op(
                 v,
                 &mut e,
@@ -479,6 +499,8 @@ impl Graph {
                 &[(1, &self.projection), (3, &self.x)],
                 c.hidden.div_ceil(64) as u32,
             );
+            Self::profile_end(v, &mut e, Stage::Attention);
+            Self::profile_begin(v, &mut e);
             self.op(
                 v,
                 &mut e,
@@ -502,9 +524,18 @@ impl Graph {
                 0,
                 (c.experts * 4) as u64,
             );
+            Self::profile_end(v, &mut e, Stage::Router);
             Self::submit(v, e);
-            let selected = ops::route(&Self::read(v, &self.router_readback)?, c.top)?;
+            let wait_before = v.stats.gpu_readback_wait_ms;
+            let router_logits = v.read_buffer(&self.router_readback)?;
+            let router_wait = v.stats.gpu_readback_wait_ms - wait_before;
+            let route_started = v.stats.profile.as_ref().map(|_| Instant::now());
+            let selected = ops::route(&router_logits, c.top)?;
             let rates: Vec<f32> = selected.iter().map(|v| v.1).collect();
+            if let (Some(profile), Some(started)) = (&mut v.stats.profile, route_started) {
+                profile.host_router_wait_ms += router_wait;
+                profile.host_route_ms += started.elapsed().as_secs_f64() * 1000.;
+            }
             v.queue
                 .write_buffer(&self.rates, 0, bytemuck::cast_slice(&rates));
             e = v
@@ -513,6 +544,8 @@ impl Graph {
                     label: Some("experts and next attention"),
                 });
             let mut shapes = Vec::new();
+            let uploaded_before = v.stats.uploaded_bytes;
+            Self::profile_begin(v, &mut e);
             for (bank, name) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
                 .iter()
                 .enumerate()
@@ -530,6 +563,9 @@ impl Graph {
                         (slot * stride) as u64,
                         stride as u64,
                     );
+                    if let Some(profile) = &mut v.stats.profile {
+                        profile.expert_bank_copy_bytes += stride as u64;
+                    }
                     shape = [
                         cols as u32,
                         rows as u32,
@@ -543,6 +579,11 @@ impl Graph {
                 }
                 shapes.push(shape);
             }
+            if let Some(profile) = &mut v.stats.profile {
+                profile.expert_uploaded_bytes += v.stats.uploaded_bytes - uploaded_before;
+            }
+            Self::profile_end(v, &mut e, Stage::ExpertCopies);
+            Self::profile_begin(v, &mut e);
             Self::mm(
                 v,
                 &mut e,
@@ -587,35 +628,47 @@ impl Graph {
                 &[(1, &self.down), (2, &self.rates), (3, &self.x)],
                 c.hidden.div_ceil(64) as u32,
             );
+            Self::profile_end(v, &mut e, Stage::Experts);
         }
-        if !want_logits {
-            Self::submit(v, e);
-            self.position = pos + 1;
-            v.stats.device_forward_ms += started.elapsed().as_secs_f64() * 1000.;
-            return Ok(Vec::new());
+        if want_logits {
+            Self::profile_begin(v, &mut e);
+            self.op(
+                v,
+                &mut e,
+                "norm",
+                &[(1, &self.x), (2, &self.output_norm), (3, &self.n)],
+                1,
+            );
+            let name = if m.tensors.contains_key("output.weight") {
+                "output.weight"
+            } else {
+                "token_embd.weight"
+            };
+            Self::matrix(v, &mut e, &mut self.params, m, name, &self.n, &self.logits)?;
+            e.copy_buffer_to_buffer(
+                &self.logits,
+                0,
+                &self.logits_readback,
+                0,
+                (c.vocab * 4) as u64,
+            );
+            Self::profile_end(v, &mut e, Stage::Logits);
         }
-        self.op(
-            v,
-            &mut e,
-            "norm",
-            &[(1, &self.x), (2, &self.output_norm), (3, &self.n)],
-            1,
-        );
-        let name = if m.tensors.contains_key("output.weight") {
-            "output.weight"
-        } else {
-            "token_embd.weight"
-        };
-        Self::matrix(v, &mut e, &mut self.params, m, name, &self.n, &self.logits)?;
-        e.copy_buffer_to_buffer(
-            &self.logits,
-            0,
-            &self.logits_readback,
-            0,
-            (c.vocab * 4) as u64,
-        );
+        if let Some(profile) = &v.gpu_profile {
+            profile.resolve(&mut e);
+        }
         Self::submit(v, e);
-        let result = Self::read(v, &self.logits_readback)?;
+        let result = if want_logits {
+            let wait_before = v.stats.gpu_readback_wait_ms;
+            let result = v.read_buffer(&self.logits_readback)?;
+            if let Some(profile) = &mut v.stats.profile {
+                profile.host_logits_wait_ms += v.stats.gpu_readback_wait_ms - wait_before;
+            }
+            result
+        } else {
+            Vec::new()
+        };
+        Self::collect_profile(v)?;
         self.position = pos + 1;
         v.stats.device_forward_ms += started.elapsed().as_secs_f64() * 1000.;
         Ok(result)

@@ -48,6 +48,29 @@ Esse modo serializa reciclagem desligada/ligada, valida os logits e grava `witho
 
 `Rodar.ps1` inclui `decode_stats` separado de `prefill_stats`, bytes de pesos solicitados, alocações/reciclagens e tempos de parede de preparo de pesos e espera no readback. Esses tempos não são timestamps de kernels nem contadores de leitura de disco. Também reporta tempo até o primeiro token e `decode_forward_tokens_per_second`. Essa última métrica usa os forwards reais de geração e exclui amostragem/impressão; o primeiro token gerado usa os logits do último token do prompt e não conta como novo forward.
 
+## Perfil por etapa no Vulkan residente
+
+```powershell
+.\Rodar.ps1 -Adapter '5700' -Prompt 'Explique ownership em Rust.' -Context 4096 -MaxTokens 32 -Profile
+```
+
+Abra `prefill_stats.profile` e `decode_stats.profile` no JSON. Os tempos são totais da fase, em milissegundos.
+
+| Campos | O que medem |
+| --- | --- |
+| `gpu_attention_ms` | Projeções de atenção, RoPE, atualização do KV, atenção e residual |
+| `gpu_router_ms` | Normalização, projeção do router e cópia dos scores para leitura |
+| `gpu_expert_copies_ms`, `expert_bank_copy_bytes` | Cópias dentro da GPU para agrupar os especialistas, inclusive quando os pesos já estão no cache |
+| `gpu_experts_ms` | Matrizes em lote dos especialistas, SwiGLU e mistura das saídas |
+| `gpu_logits_ms` | Normalização final, projeção do vocabulário e cópia dos logits para leitura |
+| `host_graph_init_ms`, `host_route_ms`, `host_submit_ms` | Inicialização do grafo, seleção de especialistas e finalização/envio dos comandos na CPU |
+| `host_router_wait_ms`, `host_logits_wait_ms` | Espera na CPU pelo resultado da fila, incluindo trabalho anterior ainda pendente na GPU |
+| `expert_uploaded_bytes`, `uploaded_bytes`, `weight_prepare_ms` | Parte dos uploads devida aos especialistas, total de bytes de pesos enviados e tempo da rotina de preparo de pesos na CPU |
+
+Os intervalos Vulkan usam o relógio da GPU. A espera na CPU pode incluir esses mesmos intervalos, então não some as duas medidas. Uploads de pesos via fila ocorrem antes dos intervalos marcados. Os bytes de upload não medem leitura do SSD nem isolam o tempo de transferência PCIe.
+
+Se `backend.gpu_timestamp_query` for `false`, o perfil da CPU continua disponível e `gpu_timestamp_steps` fica zero. O modo de diagnóstico acrescenta a leitura de timestamps e pode sincronizar o final dos tokens intermediários do prompt. `host_profile_read_ms` mede a chamada de leitura, que também pode esperar trabalho pendente. Os contadores de submissões e readbacks continuam contando apenas o caminho de inferência. Rode sem `-Profile` para comparar tokens/s.
+
 ## Antes e depois
 
 | Aspecto | Referência com execução da v0.1 | Residente 0.2 |

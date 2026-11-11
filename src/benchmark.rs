@@ -42,6 +42,11 @@ pub fn delta(a: &Stats, b: &Stats) -> Stats {
         weight_buffer_reuses: a.weight_buffer_reuses - b.weight_buffer_reuses,
         weight_prepare_ms: a.weight_prepare_ms - b.weight_prepare_ms,
         gpu_readback_wait_ms: a.gpu_readback_wait_ms - b.gpu_readback_wait_ms,
+        profile: a
+            .profile
+            .as_ref()
+            .zip(b.profile.as_ref())
+            .map(|(after, before)| after.delta(before)),
     }
 }
 pub fn run<F>(

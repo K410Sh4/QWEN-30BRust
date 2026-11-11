@@ -7,7 +7,8 @@ param(
     [int]$GpuKvMiB = 1024,
     [switch]$Reference,
     [switch]$NoWeightReuse,
-    [string]$Adapter = ''
+    [string]$Adapter = '',
+    [switch]$Profile
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -35,6 +36,7 @@ try {
     $runArgs = @('chat','--model',$Model,'--tokenizer',$tokenizerPath,'--prompt',$Prompt,'--ctx',"$Context",'--max-tokens',"$MaxTokens",'--gpu-cache-mib',"$GpuCacheMiB",'--device','vulkan','--gpu-kv-mib',"$GpuKvMiB")
     if ($NoWeightReuse) { $runArgs += '--no-weight-reuse' }
     if ($Reference) { $runArgs += '--vulkan-reference' }
+    if ($Profile) { $runArgs += '--profile' }
     if ($Adapter) { $runArgs += @('--adapter',$Adapter) }
     & $exe @runArgs
     if ($LASTEXITCODE -ne 0) { throw 'Falha na inferencia. Guarde a mensagem de erro para diagnostico.' }
