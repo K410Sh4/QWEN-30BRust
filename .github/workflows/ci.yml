@@ -1,0 +1,98 @@
+name: Rust and Vulkan validation
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: qwen-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Smoke test hardware collection in Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $csv = Join-Path $env:RUNNER_TEMP 'qwen-hardware-smoke.csv'
+          $modelPath = (Resolve-Path 'tests\data\tiny-qwen3moe.gguf').Path
+          $script = (Resolve-Path 'scripts\MedirHardware.ps1').Path
+          $job = Start-Job -FilePath $script -ArgumentList $modelPath,$csv,1
+          try {
+            $job | Wait-Job -Timeout 30 | Out-Null
+            Receive-Job -Job $job
+            if ($job.State -ne 'Completed') { throw "Hardware collector job state: $($job.State)" }
+          } finally {
+            Remove-Job -Job $job -Force
+          }
+          $sample = @(Import-Csv -LiteralPath $csv)
+          if ($sample.Count -ne 1 -or [int64]$sample[0].AvailableRamMiB -le 0) { throw 'Hardware CSV smoke test failed' }
+      - run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+      - run: rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Parse PowerShell scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Filter *.ps1 | Where-Object { $_.FullName -notmatch '[\\/]target[\\/]' } | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+          }
+      - run: cargo build --release --locked
+      - name: Smoke test Windows PowerShell helpers
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          . .\scripts\Common.ps1
+          $modelPath = Resolve-QwenModel -Model 'tests\data\tiny-qwen3moe.gguf'
+          $enginePath = Build-QwenEngine
+          & $enginePath logits --model $modelPath --tokens 1,5 --ctx 8 --device cpu
+          if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell helper smoke test failed' }
+  vulkan-software:
+    runs-on: ubuntu-latest
+    env:
+      XDG_RUNTIME_DIR: /tmp
+      QWEN_TEST_ALLOW_SOFTWARE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup default stable
+      - run: cargo test --locked -- --include-ignored
+      - run: cargo build --release --locked
+      - run: python -m pip install numpy
+      - run: python tools/reference_fixture.py --out test-output --binary target/release/qwen-rust --device vulkan --allow-software
+      - run: python tools/reference_fixture.py --out test-output/dispatch --profile dispatch
+      - name: Compare reference and resident execution
+        run: target/release/qwen-rust bench --model test-output/dispatch/tiny-qwen3moe.gguf --tokens 1,5,2,9 --ctx 16 --gpu-cache-mib 128 --compare --warmup 1 --runs 3 --allow-software > test-output/dispatch-comparison.json
+      - name: Check weight-buffer reuse under cache pressure
+        run: |
+          target/release/qwen-rust bench --model test-output/dispatch/tiny-qwen3moe.gguf --tokens 1,5,2,9 --ctx 16 --gpu-cache-mib 4 --compare-weight-reuse --warmup 1 --runs 3 --allow-software > test-output/weight-reuse-comparison.json
+          python - <<'PY'
+          import json
+          r=json.load(open('test-output/weight-reuse-comparison.json'))
+          assert r['parity']['passed']
+          for a,b in zip(r['without_reuse']['measured_stats'],r['with_reuse']['measured_stats']):
+              for key in ['uploaded_bytes','cache_hits','cache_misses','cache_evictions','weight_requested_bytes']:
+                  assert a[key]==b[key],key
+              assert b['weight_buffer_reuses']>0
+              assert b['weight_buffer_allocations']<a['weight_buffer_allocations']
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: software-vulkan-parity-and-comparison
+          path: |
+            test-output/parity-vulkan.json
+            test-output/dispatch-comparison.json
+            test-output/weight-reuse-comparison.json

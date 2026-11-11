@@ -113,9 +113,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out',type=Path,default=Path('test-output'))
     ap.add_argument('--binary',type=Path)
+    ap.add_argument('--profile',choices=['tiny','dispatch'],default='tiny')
     ap.add_argument('--device',choices=['cpu','vulkan'],default='cpu')
     ap.add_argument('--allow-software',action='store_true')
     args=ap.parse_args();args.out.mkdir(parents=True,exist_ok=True)
+    if args.profile=='dispatch':
+        global H,D,NH,NKV,E,TOP,FF,VOCAB,LAYERS,TOKENS
+        H,D,NH,NKV,E,TOP,FF,VOCAB,LAYERS=32,8,8,2,128,8,32,256,48
+        TOKENS=[f'token_{i}' for i in range(VOCAB)]
     path=args.out/'tiny-qwen3moe.gguf';w=create(path)
     tokens=[1,5,2,9];expected=reference(w,tokens)
     (args.out/'expected-logits.json').write_text(json.dumps(expected,indent=2))
@@ -128,7 +133,7 @@ def main():
             actual=np.array(json.loads(result.stdout)['logits'])
             error=float(np.max(np.abs(actual-np.array(expected[n-1]))));errors.append(error)
             np.testing.assert_allclose(actual,expected[n-1],rtol=2e-4,atol=2e-5)
-        report={'device':args.device,'tokens':tokens,'max_absolute_error_by_prefix':errors,'passed':True,'reference':'independent NumPy synthetic 2-layer Qwen3 MoE, not pretrained 30B weights'}
+        report={'device':args.device,'tokens':tokens,'max_absolute_error_by_prefix':errors,'passed':True,'profile':args.profile,'reference':f'independent NumPy synthetic {LAYERS}-layer Qwen3 MoE, not pretrained 30B weights'}
         (args.out/f'parity-{args.device}.json').write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
 
 if __name__=='__main__':main()

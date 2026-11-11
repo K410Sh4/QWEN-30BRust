@@ -3,3 +3,9 @@
 /test-output/
 *.gguf
 *.safetensors
+
+# Small synthetic test weights are intentionally versioned.
+!/tests/data/*.gguf
+
+/benchmark*.json
+__pycache__/

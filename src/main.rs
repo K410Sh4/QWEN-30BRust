@@ -9,13 +9,13 @@ use qwen_rust::{
 use std::{
     io::{self, Write},
     path::PathBuf,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Experimental native Rust Qwen3 MoE inference; Vulkan matrix kernels, CPU vector/attention operations"
+    about = "Qwen3 MoE inference with a resident Vulkan graph and batched experts"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -38,20 +38,55 @@ struct Compute {
     adapter: Option<String>,
     #[arg(long)]
     allow_software: bool,
+    /// Diagnostic v0.1-style path: CPU attention/vectors and per-matrix readback.
+    #[arg(long)]
+    vulkan_reference: bool,
+    /// Maximum memory for FP32 GPU KV values (separate from the weight cache).
+    #[arg(long, default_value_t = 1024)]
+    gpu_kv_mib: u64,
+    /// Diagnostic: allocate fresh weight buffers on cache misses.
+    #[arg(long)]
+    no_weight_reuse: bool,
+    /// Measure resident Vulkan stages with host timers and supported GPU timestamp queries.
+    #[arg(long)]
+    profile: bool,
+    /// Reuse mapped transfer buffers for resident expert uploads.
+    #[arg(long)]
+    staged_expert_uploads: bool,
 }
 impl Compute {
     fn backend(&self) -> Result<Box<dyn Backend>> {
+        ensure!(
+            !self.profile || matches!(self.device, Device::Vulkan) && !self.vulkan_reference,
+            "--profile requires the resident Vulkan graph"
+        );
+        ensure!(
+            !self.staged_expert_uploads
+                || matches!(self.device, Device::Vulkan) && !self.vulkan_reference,
+            "--staged-expert-uploads requires the resident Vulkan graph"
+        );
         Ok(match self.device {
             Device::Cpu => Box::new(Cpu::default()),
             Device::Vulkan => {
-                let v = Vulkan::new(
+                let v = Vulkan::new_with_profile(
                     self.gpu_cache_mib,
                     self.adapter.as_deref(),
                     self.allow_software,
-                )?;
+                    self.profile,
+                )?
+                .reference(self.vulkan_reference)
+                .kv_budget_mib(self.gpu_kv_mib)?
+                .weight_reuse(!self.no_weight_reuse)
+                .staged_expert_uploads(self.staged_expert_uploads);
                 eprintln!(
-                    "Vulkan adapter: {} | software={}",
-                    v.adapter_name, v.software
+                    "Vulkan adapter: {} | software={} | execution={}",
+                    v.adapter_name,
+                    v.software,
+                    if self.vulkan_reference {
+                        "reference"
+                    } else {
+                        "resident"
+                    }
                 );
                 Box::new(v)
             }
@@ -77,6 +112,30 @@ enum Command {
         tokens: Vec<u32>,
         #[arg(long, default_value_t = 4096)]
         ctx: usize,
+        #[command(flatten)]
+        compute: Compute,
+    },
+    /// Reproducible fixed-token benchmark. --compare checks every prefix against reference Vulkan.
+    Bench {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long, value_delimiter = ',', required = true)]
+        tokens: Vec<u32>,
+        #[arg(long, default_value_t = 4096)]
+        ctx: usize,
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+        #[arg(long)]
+        compare: bool,
+        /// Same resident graph and cache policy; compare buffer recycling off/on.
+        #[arg(long, conflicts_with = "compare")]
+        compare_weight_reuse: bool,
+        #[arg(long, default_value_t = 0.0005)]
+        atol: f32,
+        #[arg(long, default_value_t = 0.0005)]
+        rtol: f32,
         #[command(flatten)]
         compute: Compute,
     },
@@ -109,6 +168,12 @@ enum Command {
         compute: Compute,
     },
 }
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Devices => {
@@ -150,6 +215,73 @@ fn main() -> Result<()> {
                     &serde_json::json!({"logits":logits,"seconds":start.elapsed().as_secs_f64(),"stats":b.stats()})
                 )?
             );
+        }
+        Command::Bench {
+            model,
+            tokens,
+            ctx,
+            warmup,
+            runs,
+            compare,
+            compare_weight_reuse,
+            atol,
+            rtol,
+            mut compute,
+        } => {
+            ensure!(
+                !tokens.is_empty()
+                    && tokens.len() <= ctx
+                    && runs > 0
+                    && runs <= 100
+                    && warmup <= 100,
+                "invalid benchmark dimensions/counts"
+            );
+            ensure!(
+                atol.is_finite() && atol >= 0. && rtol.is_finite() && rtol >= 0.,
+                "invalid parity tolerances"
+            );
+            if compare || compare_weight_reuse {
+                ensure!(
+                    matches!(compute.device, Device::Vulkan),
+                    "--compare requires --device vulkan"
+                );
+                if compare_weight_reuse {
+                    ensure!(
+                        !compute.vulkan_reference,
+                        "weight-reuse comparison requires the resident graph"
+                    );
+                    compute.no_weight_reuse = true;
+                } else {
+                    compute.vulkan_reference = true;
+                }
+                let (reference, expected) =
+                    qwen_rust::benchmark::run(&model, &tokens, ctx, warmup, runs, || {
+                        compute.backend()
+                    })?;
+                if compare_weight_reuse {
+                    compute.no_weight_reuse = false;
+                } else {
+                    compute.vulkan_reference = false;
+                }
+                let (resident, actual) =
+                    qwen_rust::benchmark::run(&model, &tokens, ctx, warmup, runs, || {
+                        compute.backend()
+                    })?;
+                let parity = qwen_rust::benchmark::parity(&expected, &actual, atol, rtol)?;
+                let report = if compare_weight_reuse {
+                    serde_json::json!({"comparison":"weight_buffer_reuse","without_reuse":reference,"with_reuse":resident,"without_over_with_ratio":reference.median_seconds/resident.median_seconds,"parity":parity,"note":"Same resident graph, precision, token prefixes and cache policy. Only safe completed-buffer recycling changes. OS page cache and driver state can affect wall timings."})
+                } else {
+                    serde_json::json!({"comparison":"execution_graph","reference":reference,"resident":resident,"reference_over_resident_ratio":reference.median_seconds/resident.median_seconds,"parity":parity,"note":"Fixed token prefixes, serialized modes, same weights/precision. OS page cache and driver state may affect results. Software Vulkan results are not a Radeon benchmark."})
+                };
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                ensure!(parity.passed,"resident logits exceeded parity tolerance; do not interpret throughput as a validated improvement");
+            } else {
+                let (report, _) =
+                    qwen_rust::benchmark::run(&model, &tokens, ctx, warmup, runs, || {
+                        compute.backend()
+                    })?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            }
         }
         Command::Chat {
             model,
@@ -243,20 +375,39 @@ fn main() -> Result<()> {
             let mut sampler = Sampler::new(seed, temperature, top_k, top_p)?;
             let mut m = Model::new(gguf, ctx)?;
             eprintln!(
-                "KV cache maximum: {:.1} MiB (FP32, CPU RAM)",
+                "KV cache values at context {}: {:.1} MiB (FP32)",
+                ctx,
                 m.config.kv_bytes(ctx)? as f64 / 1048576.
             );
             let mut b = compute.backend()?;
+            eprintln!(
+                "KV location: {}",
+                if b.device_resident() {
+                    "GPU"
+                } else {
+                    "CPU RAM"
+                }
+            );
+            let prefill_started_unix_ms = unix_ms();
             let start = Instant::now();
             let mut logits = Vec::new();
             for (id, &token) in ids.iter().enumerate() {
-                logits = m.forward(token, &mut *b)?;
+                if id + 1 == ids.len() {
+                    logits = m.forward(token, &mut *b)?;
+                } else {
+                    m.forward_without_logits(token, &mut *b)?;
+                }
                 eprint!("\rPrefill {}/{}", id + 1, ids.len());
             }
             let prefill_seconds = start.elapsed().as_secs_f64();
+            let prefill_stats = b.stats().clone();
             eprintln!();
+            let decode_started_unix_ms = unix_ms();
             let decode = Instant::now();
             let mut count = 0;
+            let mut decode_steps = 0u64;
+            let mut decode_forward_seconds = 0.;
+            let mut first_token_seconds = None;
             let mut stream = tok.decode_stream(true);
             for i in 0..max_tokens {
                 for (logit, &valid) in logits.iter_mut().zip(&valid_tokens) {
@@ -276,15 +427,22 @@ fn main() -> Result<()> {
                     io::stdout().flush()?;
                 }
                 count += 1;
+                if first_token_seconds.is_none() {
+                    first_token_seconds = Some(start.elapsed().as_secs_f64());
+                }
                 if i + 1 < max_tokens {
+                    let step = Instant::now();
                     logits = m.forward(id, &mut *b)?;
+                    decode_forward_seconds += step.elapsed().as_secs_f64();
+                    decode_steps += 1;
                 }
             }
             println!();
+            let decode_stats = qwen_rust::benchmark::delta(b.stats(), &prefill_stats);
             eprintln!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &serde_json::json!({"prompt_tokens":ids.len(),"generated_tokens":count,"prefill_seconds":prefill_seconds,"generation_seconds":decode.elapsed().as_secs_f64(),"stats":b.stats(),"note":"timings include orchestration, transfers and CPU operations; not a pure GPU benchmark"})
+                    &serde_json::json!({"profile_window_unix_ms":{"prefill_start":prefill_started_unix_ms,"decode_start":decode_started_unix_ms,"decode_end":unix_ms()},"prompt_tokens":ids.len(),"generated_tokens":count,"prefill_seconds":prefill_seconds,"generation_seconds":decode.elapsed().as_secs_f64(),"time_to_first_token_seconds":first_token_seconds,"decode_forward_steps":decode_steps,"decode_forward_seconds":decode_forward_seconds,"decode_forward_tokens_per_second":if decode_forward_seconds>0.{Some(decode_steps as f64/decode_forward_seconds)}else{None},"prefill_stats":prefill_stats,"decode_stats":decode_stats,"decode_weight_upload_mib_per_step":if decode_steps>0{Some(decode_stats.uploaded_bytes as f64/1048576./decode_steps as f64)}else{None},"decode_weight_hit_rate_by_bytes":if decode_stats.weight_requested_bytes>0{Some(1.-decode_stats.uploaded_bytes as f64/decode_stats.weight_requested_bytes as f64)}else{None},"backend":b.metadata(),"stats":b.stats(),"note":"Wall timings include orchestration and transfers. The first generated token uses the last prefill logits. Sampling/printing are excluded only from decode_forward_seconds. Hardware speed is not implied by counters."})
                 )?
             );
         }

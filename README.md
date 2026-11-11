@@ -1,126 +1,164 @@
-# Qwen Rust 0.1.0 — motor próprio experimental
+# QWEN-30BRust — 0.2.1
 
-Inferência de Qwen3 MoE em Rust, com multiplicação de matrizes quantizadas em Vulkan por shaders WGSL. Reutiliza os pesos treinados do Qwen3-Coder-30B-A3B-Instruct. Não usa Ollama, llama.cpp, PyTorch ou um servidor externo para inferência.
+Motor de inferência próprio para Qwen3-Coder-30B-A3B, em Rust e Vulkan/WGSL, com os pesos treinados originais em GGUF. A versão 0.2 mantém as ativações e o cache KV na GPU e executa os especialistas em lote. Não depende de Ollama, llama.cpp ou PyTorch para inferência.
 
-**Estado:** implementação experimental do fluxo de geração completo, validada com pesos sintéticos. A execução dos pesos reais de 30B e o desempenho na RX 5700 XT ainda precisam ser validados. Não é uma substituição de produção do Ollama, nem há ganho de velocidade comprovado.
-
-## O que foi implementado
-
-- Leitor GGUF v2/v3 com mmap, verificação de limites, alinhamento e dimensões.
-- F32, F16, Q4_0, Q8_0, Q4_K, Q5_K e Q6_K; cobre os tipos encontrados na distribuição Ollama Q4_K_M examinada.
-- Embeddings, RMSNorm, normalização de Q/K, RoPE NeoX, atenção causal GQA e cache KV.
-- Roteamento MoE por top-k com renormalização, SwiGLU dos especialistas e conexões residuais.
-- Projeção do vocabulário, tokenização oficial, ChatML de uma rodada, EOS, saída incremental e amostragem com seed, temperatura, top-k e top-p.
-- Backend CPU de referência e backend Vulkan para matrizes, sem fallback silencioso.
-- Cache LRU de pesos compactados na GPU e divisão de matrizes quando excedem o limite de buffer do adaptador.
-- Comandos `devices`, `inspect`, `logits` e `chat`.
-
-## Distribuição real do trabalho
-
-| Operação | Backend Vulkan selecionado |
-| --- | --- |
-| Q/K/V, projeção de atenção, router e matrizes dos especialistas | GPU, com pesos quantizados |
-| Projeção final do vocabulário | GPU |
-| Leitura de embeddings, normalizações, RoPE e residuais | CPU |
-| Atenção sobre o histórico e cache KV FP32 | CPU / RAM |
-| Seleção dos especialistas, tokenização e amostragem | CPU |
-
-O código de inferência é Rust e os kernels são WGSL; `wgpu` acessa Vulkan e o driver da placa. Isso não significa que todas as operações já ficam na GPU.
+**Estado:** experimental. A versão 0.2.1 acrescenta reciclagem segura de buffers de pesos e diagnóstico dos tempos de upload/espera.  A versão 0.1 foi executada pelo operador na RX 5700 XT e gerou texto. A versão 0.2 passou nos testes numéricos e no benchmark sintético com Vulkan por software; a velocidade do 30B real na Radeon precisa ser medida com `Benchmark.ps1`. Consulte [VALIDACAO.md](VALIDACAO.md) para resultados e limitações.
 
 ## Executar no Windows
 
-Pré-requisitos: Rust stable atualizado, Visual Studio Build Tools com ferramentas MSVC para C++ e Windows SDK, e driver AMD com Vulkan. A compilação/testes locais deste pacote usaram Rust 1.99.1 no Linux; Windows e PowerShell não foram executados neste ambiente. O Build Tools é usado pelo toolchain; o motor de inferência não incorpora llama.cpp.
+Use Rust stable atualizado, MSVC/Windows SDK e o driver AMD com Vulkan. Na primeira instalação, Rust pode solicitar as ferramentas de C++ do Visual Studio Build Tools. Se Cargo não for encontrado, reabra o terminal; os scripts também tentam localizar `%USERPROFILE%\.cargo\bin`.
 
-Extraia o ZIP e abra o PowerShell na pasta `qwen-rust`:
+Clone a branch indicada no PR, ou `main` depois da integração. Abra o PowerShell na raiz do repositório:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 rustup update stable
 rustup component add rustfmt clippy
 .\Verificar.ps1 -GPU
-.\Rodar.ps1 -Prompt 'Crie uma funcao Rust para ordenar uma lista.'
+.\Rodar.ps1 -Adapter '5700' -Prompt 'Crie uma funcao Rust para ordenar uma lista.'
 ```
 
-`Rodar.ps1` procura o manifesto local de `qwen3-coder:30b` e abre seu blob GGUF existente. Não chama o Ollama nem altera o modelo. Se `OLLAMA_MODELS` estiver definido, usa esse diretório. Caso não encontre o arquivo:
+A política de execução acima vale apenas para a janela atual. `Rodar.ps1` compila o executável, localiza o blob de `qwen3-coder:30b` no armazenamento local do Ollama e reutiliza seus pesos sem iniciar o Ollama. Respeita `OLLAMA_MODELS`; se necessário, informe `-Model 'D:\Modelos\modelo.gguf'`.
+
+O script baixa apenas o tokenizer oficial, por revisão e SHA-256 fixados. Os pesos reais não estão neste repositório e não são baixados automaticamente. O tokenizer é conferido contra a tabela GGUF, e os tokens extras de padding dos embeddings são mascarados.
+
+Para executar o caminho antigo como diagnóstico:
 
 ```powershell
-.\Rodar.ps1 -Model 'D:\Modelos\Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf' -Prompt 'Explique ownership em Rust.'
+.\Rodar.ps1 -Reference -Adapter '5700' -Prompt 'Explique ownership em Rust.'
 ```
 
-O script compila em release, valida o GGUF, lista adaptadores e baixa somente o `tokenizer.json` oficial, fixado por revisão e SHA-256. Os pesos reais de 30B não estão no pacote. O programa verifica a correspondência de cada token do tokenizer com a tabela GGUF; posições extras de padding no vocabulário do modelo são mascaradas na amostragem.
-
-Para selecionar a placa, se houver mais de um adaptador:
+## Medir no seu PC
 
 ```powershell
-.\Rodar.ps1 -Adapter '5700' -GpuCacheMiB 4096 -MaxTokens 64
+.\Benchmark.ps1 -Adapter '5700' -Context 4096 -GpuCacheMiB 4096 -Runs 3 -Warmup 1
 ```
 
-O cache padrão de 4096 MiB é apenas o orçamento de pesos na GPU. Buffers de trabalho, o driver e o desktop consomem memória adicional. Reduza o cache se houver falta de VRAM; reduzir pode aumentar transferências e lentidão.
+O teste executa os modos de referência e residente, **um por vez**, com o mesmo arquivo, precisão FP32 e sequência explícita de tokens. Guarda `benchmark-result.json`, verifica todos os prefixos de logits e informa tokens/s, razão entre tempos, transferências, readbacks e alocações. O primeiro ciclo é reportado separado dos ciclos medidos. Um erro de paridade termina com código de falha; uma razão de velocidade não é garantia de correção.
 
-## Uso direto da CLI
+Para isolar o efeito da reciclagem sem mudar o grafo residente ou a política do cache:
+
+```powershell
+.\Benchmark.ps1 -Adapter '5700' -CompareWeightReuse -OutFile 'benchmark-weight-reuse.json'
+```
+
+Esse modo serializa reciclagem desligada/ligada, valida os logits e grava `without_reuse`/`with_reuse`. A comparação padrão de grafo mantém as chaves `reference`/`resident`. `Rodar.ps1 -NoWeightReuse` ou `--no-weight-reuse` na CLI desativa a reciclagem para diagnóstico. Reduzir alocações não garante melhorar tokens/s; a versão 0.2.1 não altera o tamanho do cache nem diminui os bytes transferidos para os mesmos acessos.
+
+É um teste de forward em prefixos fixos, não um benchmark de conversa natural nem de qualidade. Cache de páginas do sistema, ordem dos modos e estado do driver podem afetar o resultado; repita a medição. Para uma primeira comparação mais curta, use `-Runs 1 -Warmup 0`. O caminho de referência pode levar tempo.
+
+`Rodar.ps1` inclui `decode_stats` separado de `prefill_stats`, bytes de pesos solicitados, alocações/reciclagens e tempos de parede de preparo de pesos e espera no readback. Esses tempos não são timestamps de kernels nem contadores de leitura de disco. Também reporta tempo até o primeiro token e `decode_forward_tokens_per_second`. Essa última métrica usa os forwards reais de geração e exclui amostragem/impressão; o primeiro token gerado usa os logits do último token do prompt e não conta como novo forward.
+
+## Perfil por etapa no Vulkan residente
+
+```powershell
+.\Rodar.ps1 -Adapter '5700' -Prompt 'Explique ownership em Rust.' -Context 4096 -MaxTokens 32 -Profile
+```
+
+Abra `prefill_stats.profile` e `decode_stats.profile` no JSON. Os tempos são totais da fase, em milissegundos.
+
+| Campos | O que medem |
+| --- | --- |
+| `gpu_attention_ms` | Projeções de atenção, RoPE, atualização do KV, atenção e residual |
+| `gpu_router_ms` | Normalização, projeção do router e cópia dos scores para leitura |
+| `gpu_expert_copies_ms`, `expert_bank_copy_bytes` | Cópias dentro da GPU para agrupar os especialistas, inclusive quando os pesos já estão no cache |
+| `gpu_experts_ms` | Matrizes em lote dos especialistas, SwiGLU e mistura das saídas |
+| `gpu_logits_ms` | Normalização final, projeção do vocabulário e cópia dos logits para leitura |
+| `host_graph_init_ms`, `host_route_ms`, `host_submit_ms` | Inicialização do grafo, seleção de especialistas e finalização/envio dos comandos na CPU |
+| `host_router_wait_ms`, `host_logits_wait_ms` | Espera na CPU pelo resultado da fila, incluindo trabalho anterior ainda pendente na GPU |
+| `expert_uploaded_bytes`, `uploaded_bytes`, `weight_prepare_ms` | Parte dos uploads devida aos especialistas, total de bytes de pesos enviados e tempo da rotina de preparo de pesos na CPU |
+
+Os intervalos Vulkan usam o relógio da GPU. A espera na CPU pode incluir esses mesmos intervalos, então não some as duas medidas. Uploads de pesos via fila ocorrem antes dos intervalos marcados. Os bytes de upload não medem leitura do SSD nem isolam o tempo de transferência PCIe.
+
+Se `backend.gpu_timestamp_query` for `false`, o perfil da CPU continua disponível e `gpu_timestamp_steps` fica zero. O modo de diagnóstico acrescenta a leitura de timestamps e pode sincronizar o final dos tokens intermediários do prompt. `host_profile_read_ms` mede a chamada de leitura, que também pode esperar trabalho pendente. Os contadores de submissões e readbacks continuam contando apenas o caminho de inferência. Rode sem `-Profile` para comparar tokens/s.
+
+### Comparar uploads e monitorar o hardware no Windows
+
+Rode na mesma pasta, com o mesmo GGUF, prompt, contexto e orçamento de pesos. Use nomes diferentes para os CSVs de novas rodadas.
+
+```powershell
+.\Rodar.ps1 -Adapter '5700' -Context 4096 -GpuCacheMiB 4096 -MaxTokens 32 -Prompt 'Explique ownership em Rust.' -Profile -HardwareCsv 'hardware-base.csv'
+.\Rodar.ps1 -Adapter '5700' -Context 4096 -GpuCacheMiB 4096 -MaxTokens 32 -Prompt 'Explique ownership em Rust.' -Profile -HardwareCsv 'hardware-staging.csv' -StagedExpertUploads
+```
+
+- `host_weight_alloc_ms` mede a chamada que cria buffers de destino. `host_weight_write_ms` mede a preparação do envio na CPU e inclui os acessos às páginas mapeadas do GGUF durante a cópia. `host_weight_padding_ms` mede a cópia para alinhar pesos quando necessária. `weight_prepare_ms` inclui também o trabalho do cache. Esses tempos de host não isolam o tempo de PCIe.
+- `-StagedExpertUploads` reutiliza buffers de transferência em blocos de 4 MiB, com até 32 MiB de dados preparados por submissão. `expert_staged_bytes` mede quantos bytes passaram por esse caminho. Em modo experimental, `gpu_expert_copies_ms` inclui também essas transferências registradas no encoder. Compare tempo total e uploads nos dois modos. Repita em ordem invertida para reduzir a influência do cache de arquivos do Windows.
+- O CSV amostra leituras do volume do GGUF, leituras totais dos volumes, RAM disponível, memória comprometida e leituras de páginas do Windows. Compare `UnixMsUtc` com `profile_window_unix_ms` no JSON. São contadores de volume e do sistema, que também incluem outros processos. O CSV não altera parâmetros de hardware ou do Windows.
+
+Depois do A/B, mantenha o caminho mais rápido e teste o orçamento de pesos separadamente. Em 4096 de contexto, o KV reserva 768 MiB. Se os prompts e respostas couberem em 1024, o KV reserva 192 MiB. Monitore o uso de memória dedicada e compartilhada ao ajustar o cache de pesos na RX 5700 XT. Se a RAM disponível cair enquanto as leituras de páginas e do volume sobem na fase de preparo, compare uma rodada com os demais programas pesados fechados antes de decidir sobre RAM ou SSD.
+
+## Antes e depois
+
+| Aspecto | Referência com execução da v0.1 | Residente 0.2 |
+| --- | --- | --- |
+| Ativações intermediárias | Retornam à CPU após cada matriz | Permanecem na GPU |
+| RMSNorm, RoPE, atenção GQA e residuais | CPU | GPU |
+| Cache KV FP32 | RAM | VRAM |
+| Matrizes dos 8 especialistas por camada | 24 dispatches separados | 3 dispatches com dimensão de lote |
+| Leituras síncronas para um token com logits no 30B de 48 camadas | 1393 | 49: 48 routers e logits finais |
+| Envios explícitos por token com logits | 1393 | 49 |
+| Buffers de trabalho | Recriados por matriz | Reutilizados entre tokens |
+| Projeção do vocabulário durante prefill | Calculada por token | Calculada só no último token |
+| Amostragem top-k | Ordenação de todo o vocabulário | Seleção parcial e ordenação do subconjunto |
+| Descarte do cache de pesos | Busca linear da entrada mais antiga | Heap LRU com compactação de entradas antigas |
+
+A leitura do router na CPU permanece para decidir quais especialistas carregar. Embeddings, roteamento, tokenização e amostragem continuam na CPU. O cache de pesos permanece separado dos bancos reutilizáveis dos especialistas. Não houve poda de camadas, redução de especialistas ativos nem troca dos pesos ou da arquitetura.
+
+## Memória na RX 5700 XT
+
+- O GGUF examinado tem aproximadamente 18,6 GB; a placa tem 8 GB de VRAM. Acesso a RAM/arquivo continua necessário.
+- `-GpuCacheMiB 4096` é o orçamento de **pesos**, não o consumo total de VRAM.
+- O KV FP32 do 30B para contexto 4096 ocupa 768 MiB de valores na GPU. Some bancos dos especialistas, ativações, driver e desktop.
+- `-GpuKvMiB 1024` é um limite de segurança para KV, separado do cache de pesos. Um contexto que o exceda é recusado. Aumentá-lo explicitamente não comprova disponibilidade de VRAM.
+- `mmap` permite acesso ao arquivo, mas paginação/leituras frequentes do SSD podem limitar muito a velocidade nos 16 GB de RAM do PC.
+- Reduza `-Context` se o prompt couber num contexto menor; isso reduz a reserva KV, sem garantir aceleração de todos os componentes. Reduza o cache de pesos em caso de falta de VRAM; mais transferências podem tornar a geração mais lenta.
+
+Não substitua, trunque ou edite o GGUF enquanto estiver mapeado pelo programa.
+
+## CLI
 
 ```powershell
 cargo build --release --locked
 .\target\release\qwen-rust.exe devices
 .\target\release\qwen-rust.exe inspect --model 'D:\Modelos\modelo.gguf' --ctx 4096
-.\target\release\qwen-rust.exe chat --model 'D:\Modelos\modelo.gguf' --tokenizer '.\models\tokenizer.json' --prompt 'O que e borrowing?' --device vulkan --ctx 4096 --max-tokens 128
-.\target\release\qwen-rust.exe logits --model 'D:\Modelos\modelo.gguf' --tokens 151644,894 --device vulkan
+.\target\release\qwen-rust.exe chat --model 'D:\Modelos\modelo.gguf' --tokenizer models/tokenizer.json --prompt 'Explique borrowing.' --adapter 5700
+.\target\release\qwen-rust.exe bench --model 'D:\Modelos\modelo.gguf' --tokens 151644,894,198,2683 --ctx 4096 --compare --runs 3
 ```
 
-`--device cpu` executa a referência lenta na CPU. `--allow-software` é uma opção explícita de diagnóstico para Vulkan por software, não aceleração física. `--raw` desativa os wrappers ChatML. A saída de texto vai para stdout; progresso, identificação do adaptador e métricas vão para stderr.
+`--vulkan-reference` seleciona o caminho diagnóstico. `--device cpu` executa a referência CPU. Adaptadores por software exigem `--allow-software`; não há fallback silencioso. `--raw` fornece texto sem wrappers ChatML. Texto vai para stdout e progresso/métricas para stderr.
 
-O limite `--ctx` cobre prompt e geração. A CLI recusa o pedido se `tokens_do_prompt + max_tokens > ctx`. O modelo permanece mapeado em modo de leitura: não substitua, trunque ou edite o arquivo enquanto o processo estiver aberto.
+Aceita GGUF v2/v3 único, arquitetura `qwen3moe`, Q/K/V separados e tipos F32, F16, Q4_0, Q8_0, Q4_K, Q5_K e Q6_K. Sem shards, IQ/Q2/Q3, modelos dense/Next/VL, LoRA, treinamento ou RoPE escalado/YaRN. As verificações recusam configurações não implementadas.
 
-## Limites materiais desta versão
-
-- O arquivo examinado tem 18.556.688.736 bytes. Ele não cabe integralmente nos 8 GB de VRAM da RX 5700 XT. São necessários RAM e acesso ao arquivo; os 16 GB de RAM do PC também serão disputados pelo Windows e pelo restante do programa.
-- `mmap` não transforma o SSD em memória rápida. Se páginas forem continuamente descartadas e relidas, a inferência pode ficar muito lenta.
-- O cache KV usa FP32 na RAM: 768 MiB de valores para contexto 4096 no 30B, além de capacidades das alocações e demais dados.
-- Prefill sequencial, sincronização e retorno à CPU depois de cada matvec. No modelo de 48 camadas/top-8 isso representa 1393 matvecs por token. Pode ser substancialmente mais lento que motores maduros.
-- Sem atenção GPU, prefill em lote, FlashAttention, cache KV quantizado, kernels MoE agrupados ou retenção das ativações na GPU nesta versão.
-- Aceita GGUF único de arquitetura `qwen3moe`, com tensores separados de Q/K/V e nomes padronizados. Não implementa shards, arquiteturas densas/Next/VL, outros formatos IQ/Q2/Q3, LoRA, treinamento, API HTTP ou RoPE escalado/YaRN.
-- O cabeçalho e o tokenizer do modelo real foram conferidos. Não houve geração com os pesos treinados reais de 30B, nem medição na RX 5700 XT. O benchmark antigo do Ollama não é resultado deste motor.
-
-## Verificação
+## Testes e CI
 
 ```powershell
-cargo test --locked
-cargo test --locked -- --ignored
-cargo clippy --locked --all-targets -- -D warnings
-cargo fmt --check
+.\Verificar.ps1
+.\Verificar.ps1 -GPU
 ```
 
-Os testes marcados `ignored` precisam de Vulkan e são executados explicitamente pelo segundo comando. Por padrão recusam adaptadores classificados como CPU. Para validar intencionalmente com um Vulkan por software, defina `QWEN_TEST_ALLOW_SOFTWARE=1` somente no ambiente de teste.
+A CI verifica formatação, Clippy, testes CPU e compilação release no Linux/Windows; o job Linux com Mesa executa os testes Vulkan, a referência NumPy e a comparação de 48 camadas. A passagem desses jobs não é um teste na RX 5700 XT nem do modelo real 30B.
 
-`tests/data/tiny-qwen3moe.gguf` contém pesos aleatórios sintéticos de duas camadas, criados para teste; não é um modelo treinado. Os logits esperados vêm de uma implementação NumPy independente em `tools/reference_fixture.py`. Os testes Rust comuns não dependem de Python. Para regenerar/conferir a referência, use Python com NumPy:
+`tests/data/tiny-qwen3moe.gguf` contém apenas pesos sintéticos de duas camadas. Testes geram temporariamente os tensores de quantização mista. Para reproduzir o cenário sintético de 48 camadas com Python/NumPy:
 
 ```powershell
-python tools/reference_fixture.py --binary target/release/qwen-rust.exe --device cpu
-python tools/reference_fixture.py --binary target/release/qwen-rust.exe --device vulkan
+python tools/reference_fixture.py --out test-output/dispatch --profile dispatch
+.\target\release\qwen-rust.exe bench --model test-output/dispatch/tiny-qwen3moe.gguf --tokens 1,5,2,9 --ctx 16 --gpu-cache-mib 128 --compare --runs 5
 ```
 
-Consulte `VALIDACAO.md` para resultados e alcance exato da validação.
+Veja [OPTIMIZATION.md](OPTIMIZATION.md) para limites, contrato dos contadores e próximas otimizações.
 
-## Estrutura
+## Código e referências
 
 | Arquivo | Responsabilidade |
 | --- | --- |
-| `src/gguf.rs` | Metadados, tensores, validação e mapeamento do GGUF |
-| `src/quant.rs` | Descompactação CPU de referência |
-| `src/backend.rs` | Matvec CPU/Vulkan, cache, transferências e métricas |
-| `shaders/matvec.wgsl` | Descompactação e redução das matrizes na GPU |
-| `src/ops.rs` | RMSNorm, RoPE, atenção e seleção MoE |
-| `src/model.rs` | Configuração e forward causal completo |
-| `src/sampling.rs` | Seleção do próximo token |
-| `src/main.rs` | CLI, tokenizer, ChatML e geração |
-| `tests/` | Layouts quantizados, referência numérica, parser, cache e CLI |
-| `Rodar.ps1` / `Verificar.ps1` | Execução e verificação no Windows |
+| `src/gpu_graph.rs`, `shaders/ops.wgsl` | Grafo residente, atenção, KV e operações vetoriais |
+| `src/backend.rs`, `shaders/matvec.wgsl` | Cache de pesos, matvec quantizado e em lote, referência Vulkan |
+| `src/model.rs`, `src/ops.rs`, `src/quant.rs` | Forward e operações CPU de referência |
+| `src/sampling.rs`, `src/main.rs` | Amostragem, tokenizer, ChatML e CLI |
+| `src/benchmark.rs`, `Benchmark.ps1` | Comparação de execução e paridade |
+| `scripts/Common.ps1`, `Rodar.ps1`, `Verificar.ps1` | Preparação, execução e verificações Windows |
 
-## Fontes e pesos
+Modelo/configuração: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct . Tokenizer fixado em `b2cff646eb4bb1d68355c01b18ae02e7cf42d120`, SHA-256 `19564a48c4f71a2a1b937cce34c737a1e662b171c5f5d7edf641a15cd896f07d`.
 
-- Modelo/configuração: https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct
-- Revisão do tokenizer: `b2cff646eb4bb1d68355c01b18ae02e7cf42d120`.
-- SHA-256 do tokenizer: `19564a48c4f71a2a1b937cce34c737a1e662b171c5f5d7edf641a15cd896f07d`.
-- Layouts GGML/GGUF e nomes dos tensores: https://github.com/ggml-org/llama.cpp/tree/master/ggml e https://github.com/ggml-org/llama.cpp/tree/master/gguf-py . Referências de interoperabilidade; não são dependências de execução.
-- Backend Rust/Vulkan: https://github.com/gfx-rs/wgpu . Dependência fixada em `0.19.4` e `Cargo.lock` incluído para reproduzir o build validado.
+Interoperabilidade GGUF/GGML: https://github.com/ggml-org/llama.cpp/tree/master/ggml e https://github.com/ggml-org/llama.cpp/tree/master/gguf-py . Backend: https://github.com/gfx-rs/wgpu (0.19.4 fixado; `Cargo.lock` incluído).
 
-O código deste projeto usa MIT. Os pesos originais Qwen têm licença própria Apache-2.0; preserve seus avisos ao redistribuí-los. O pacote não redistribui os pesos reais nem o tokenizer oficial.
+Código do projeto: MIT. Pesos originais Qwen: Apache-2.0, com avisos próprios a preservar se redistribuídos. O repositório não redistribui os pesos reais nem o tokenizer oficial.

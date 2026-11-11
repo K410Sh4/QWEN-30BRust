@@ -40,6 +40,57 @@ fn sampler_seed_and_greedy() {
         );
     }
 }
+
+#[test]
+fn sampler_topk_matches_full_sort_distribution() {
+    // Compare the optimized partial selection against the old full-sort CDF.
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    let logits: Vec<f32> = (0..1000).map(|i| ((i * 97) % 31) as f32 / 11.).collect();
+    for top in [0, 1, 20, 999, 1000, 2000] {
+        let mut sampler = Sampler::new(123, 0.7, top, 0.8).unwrap();
+        let mut rng = StdRng::seed_from_u64(123);
+        let mut ids: Vec<usize> = (0..logits.len()).collect();
+        ids.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+        if top > 0 {
+            ids.truncate(top.min(ids.len()));
+        }
+        let mut probs: Vec<f32> = ids
+            .iter()
+            .map(|&i| ((logits[i] - logits[ids[0]]) / 0.7).exp())
+            .collect();
+        let total: f32 = probs.iter().sum();
+        let mut cumulative = 0.;
+        let mut len = probs.len();
+        for (i, &p) in probs.iter().enumerate() {
+            cumulative += p / total;
+            if cumulative >= 0.8 {
+                len = i + 1;
+                break;
+            }
+        }
+        probs.truncate(len);
+        ids.truncate(len);
+        let total: f32 = probs.iter().sum();
+        for _ in 0..40 {
+            let mut draw = rng.gen::<f32>() * total;
+            let mut expected = *ids.last().unwrap();
+            for (&id, &prob) in ids.iter().zip(&probs) {
+                if draw < prob {
+                    expected = id;
+                    break;
+                }
+                draw -= prob;
+            }
+            assert_eq!(
+                sampler.sample(&logits).unwrap(),
+                expected as u32,
+                "top={top}"
+            );
+        }
+    }
+    let mut sampler = Sampler::new(0, 0., 0, 1.).unwrap();
+    assert_eq!(sampler.sample(&[1., 1., 0.]).unwrap(), 0);
+}
 #[test]
 fn reject_bad_quant_shapes() {
     assert!(quant::row_bytes(12, 255).is_err());

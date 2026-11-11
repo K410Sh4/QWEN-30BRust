@@ -1,3 +1,4 @@
+mod common;
 use qwen_rust::{backend::Cpu, gguf::Gguf, model::Model};
 use std::{
     fs,
@@ -115,4 +116,225 @@ fn full_vulkan_forward_matches_numpy() {
     for (a, b) in actual.iter().zip(&expected[0]) {
         assert!((a - b).abs() < 2e-5);
     }
+}
+
+#[test]
+fn skipping_prefill_logits_preserves_causal_state() {
+    let mut full = Model::new(Gguf::open(&fixture()).unwrap(), 8).unwrap();
+    let mut fast = Model::new(Gguf::open(&fixture()).unwrap(), 8).unwrap();
+    let mut a = Cpu::default();
+    let mut b = Cpu::default();
+    let mut expected = Vec::new();
+    for token in [1, 5, 2] {
+        expected = full.forward(token, &mut a).unwrap();
+    }
+    fast.forward_without_logits(1, &mut b).unwrap();
+    fast.forward_without_logits(5, &mut b).unwrap();
+    assert_eq!(fast.forward(2, &mut b).unwrap(), expected);
+    use qwen_rust::backend::Backend;
+    assert_eq!(a.stats().matvecs - b.stats().matvecs, 2);
+}
+
+#[test]
+#[ignore = "requires Vulkan; checks persistent allocations, counters, reset and skipped prefill"]
+fn resident_state_and_counters() {
+    use qwen_rust::backend::{Backend, Vulkan};
+    let allow = std::env::var("QWEN_TEST_ALLOW_SOFTWARE").as_deref() == Ok("1");
+    for budget in [0, 1] {
+        let mut gpu = Vulkan::new(budget, None, allow).unwrap();
+        let mut m = Model::new(Gguf::open(&fixture()).unwrap(), 8).unwrap();
+        m.forward_without_logits(1, &mut gpu).unwrap();
+        let allocations = gpu.stats().workspace_allocations;
+        m.forward_without_logits(5, &mut gpu).unwrap();
+        let actual = m.forward(2, &mut gpu).unwrap();
+        let expected: Vec<Vec<f32>> =
+            serde_json::from_str(include_str!("data/expected-logits.json")).unwrap();
+        for (a, b) in actual.iter().zip(&expected[2]) {
+            assert!((a - b).abs() < 2e-5);
+        }
+        assert_eq!(gpu.stats().readbacks, 7);
+        assert_eq!(gpu.stats().submissions, 9); // 3*2 routers + 1 final logits.
+                                                // The only extra persistent object is the LM-head matrix-shape uniform.
+        assert!(gpu.stats().workspace_allocations <= allocations + 1);
+        m.reset();
+        let actual = m.forward(1, &mut gpu).unwrap();
+        for (a, b) in actual.iter().zip(&expected[0]) {
+            assert!((a - b).abs() < 2e-5);
+        }
+    }
+    // Switching a live Model to the other KV location must fail and reset,
+    // rather than silently treating the current token as an empty history.
+    let mut gpu = Vulkan::new(1, None, allow).unwrap();
+    let mut cpu = Cpu::default();
+    let mut m = Model::new(Gguf::open(&fixture()).unwrap(), 8).unwrap();
+    m.forward(1, &mut gpu).unwrap();
+    assert!(m
+        .forward(5, &mut cpu)
+        .unwrap_err()
+        .to_string()
+        .contains("reset the model"));
+    assert_eq!(m.position, 0);
+    m.forward(1, &mut cpu).unwrap();
+    assert!(m.forward(5, &mut gpu).is_err());
+    let mut gpu = Vulkan::new(0, None, allow)
+        .unwrap()
+        .kv_budget_mib(0)
+        .unwrap();
+    let mut m = Model::new(Gguf::open(&fixture()).unwrap(), 8).unwrap();
+    assert!(m
+        .forward(1, &mut gpu)
+        .unwrap_err()
+        .to_string()
+        .contains("GPU KV cache"));
+    assert_eq!(m.position, 0);
+}
+
+#[test]
+#[ignore = "requires Vulkan; compares mixed packed expert banks to CPU and reference Vulkan"]
+fn mixed_quantized_resident_matches_reference() {
+    use qwen_rust::backend::Vulkan;
+    let allow = std::env::var("QWEN_TEST_ALLOW_SOFTWARE").as_deref() == Ok("1");
+    let file = common::quantized();
+    let path = &file.0;
+    let mut cpu = Cpu::default();
+    let mut model = Model::new(Gguf::open(path).unwrap(), 8).unwrap();
+    let mut expected = Vec::new();
+    for id in [1, 5, 2, 9] {
+        expected.push(model.forward(id, &mut cpu).unwrap());
+    }
+    for reference in [true, false] {
+        let mut gpu = Vulkan::new(1, None, allow).unwrap().reference(reference); // force eviction on this >1MiB model.
+        let mut m = Model::new(Gguf::open(path).unwrap(), 8).unwrap();
+        let mut actual = Vec::new();
+        for id in [1, 5, 2, 9] {
+            actual.push(m.forward(id, &mut gpu).unwrap());
+        }
+        let comparison = qwen_rust::benchmark::parity(&expected, &actual, 0.00005, 0.0002).unwrap();
+        assert!(
+            comparison.passed,
+            "reference={reference}: max_error={} mismatches={}",
+            comparison.max_absolute_error, comparison.mismatches
+        );
+    }
+}
+
+#[test]
+fn benchmark_cli_reports_measured_steps() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_qwen-rust"))
+        .args(["bench", "--model"])
+        .arg(fixture())
+        .args([
+            "--tokens", "1,5", "--ctx", "8", "--runs", "2", "--warmup", "0", "--device", "cpu",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["measured_seconds"].as_array().unwrap().len(), 2);
+    assert!(report["forward_tokens_per_second"].as_f64().unwrap() > 0.);
+    assert_eq!(report["measured_stats"][0]["matvecs"], 46);
+}
+
+#[test]
+#[ignore = "requires Vulkan; covers attention softmax across the 64-thread boundary"]
+fn resident_attention_longer_than_one_workgroup() {
+    let file = common::long_context();
+    let mut cpu = Cpu::default();
+    let allow = std::env::var("QWEN_TEST_ALLOW_SOFTWARE").as_deref() == Ok("1");
+    let mut gpu = qwen_rust::backend::Vulkan::new(1, None, allow).unwrap();
+    let mut a = Model::new(Gguf::open(&file.0).unwrap(), 80).unwrap();
+    let mut b = Model::new(Gguf::open(&file.0).unwrap(), 80).unwrap();
+    for i in 0..80 {
+        let token = ((i * 7) % 16) as u32;
+        if [0, 31, 63, 64, 79].contains(&i) {
+            let expected = a.forward(token, &mut cpu).unwrap();
+            let actual = b.forward(token, &mut gpu).unwrap();
+            assert!(
+                qwen_rust::benchmark::parity(&[expected], &[actual], 0.00002, 0.0002)
+                    .unwrap()
+                    .passed
+            );
+        } else {
+            a.forward_without_logits(token, &mut cpu).unwrap();
+            b.forward_without_logits(token, &mut gpu).unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires Vulkan; checks GPU stage profiling and logits parity"]
+fn stage_profiling_preserves_logits_and_inference_counters() {
+    use qwen_rust::{
+        backend::{Backend, Vulkan},
+        benchmark::delta,
+    };
+
+    let allow = std::env::var("QWEN_TEST_ALLOW_SOFTWARE").as_deref() == Ok("1");
+    let mut gpu = Vulkan::new_with_profile(1, None, allow, true).unwrap();
+    let mut model = Model::new(Gguf::open(&fixture()).unwrap(), 8).unwrap();
+    let expected: Vec<Vec<f32>> =
+        serde_json::from_str(include_str!("data/expected-logits.json")).unwrap();
+
+    model.forward_without_logits(1, &mut gpu).unwrap();
+    let prefill = gpu.stats().clone();
+    let actual = model.forward(5, &mut gpu).unwrap();
+    for (a, b) in actual.iter().zip(&expected[1]) {
+        assert!((a - b).abs() < 2e-5);
+    }
+    let step = delta(gpu.stats(), &prefill);
+    assert_eq!(step.submissions, model.config.layers as u64 + 1);
+    assert_eq!(step.readbacks, step.submissions);
+    let profile = step.profile.unwrap();
+    assert!(profile.expert_bank_copy_bytes > 0);
+    assert!(profile.expert_uploaded_bytes <= step.uploaded_bytes);
+    let prefill_profile = prefill.profile.unwrap();
+    assert_eq!(prefill_profile.gpu_logits_ms, 0.);
+    assert_eq!(prefill_profile.host_logits_wait_ms, 0.);
+    if gpu.metadata()["gpu_timestamp_query"] == true {
+        assert_eq!(prefill_profile.gpu_timestamp_steps, 1);
+        assert_eq!(profile.gpu_timestamp_steps, 1);
+        assert!(profile.gpu_attention_ms > 0.);
+        assert!(profile.gpu_experts_ms > 0.);
+        assert!(profile.gpu_logits_ms > 0.);
+    } else {
+        assert_eq!(profile.gpu_timestamp_steps, 0);
+    }
+}
+
+#[test]
+#[ignore = "requires Vulkan; checks staged expert uploads under cache pressure"]
+fn staged_expert_uploads_preserve_logits_and_cache_counters() {
+    use qwen_rust::backend::{Backend, Vulkan};
+
+    let allow = std::env::var("QWEN_TEST_ALLOW_SOFTWARE").as_deref() == Ok("1");
+    let run = |staged| {
+        let mut gpu = Vulkan::new_with_profile(0, None, allow, true)
+            .unwrap()
+            .staged_expert_uploads(staged);
+        let mut model = Model::new(Gguf::open(&fixture()).unwrap(), 8).unwrap();
+        model.forward_without_logits(1, &mut gpu).unwrap();
+        model.forward_without_logits(5, &mut gpu).unwrap();
+        let logits = model.forward(2, &mut gpu).unwrap();
+        (logits, gpu.stats().clone())
+    };
+    let (expected, baseline) = run(false);
+    let (actual, staged) = run(true);
+    assert!(
+        qwen_rust::benchmark::parity(&[expected], &[actual], 0.00002, 0.0002)
+            .unwrap()
+            .passed
+    );
+    assert_eq!(baseline.uploaded_bytes, staged.uploaded_bytes);
+    assert_eq!(baseline.cache_misses, staged.cache_misses);
+    assert_eq!(baseline.submissions, staged.submissions);
+    assert_eq!(baseline.readbacks, staged.readbacks);
+    let profile = staged.profile.unwrap();
+    assert!(profile.expert_staged_bytes > 0);
+    assert_eq!(profile.expert_staged_bytes, profile.expert_uploaded_bytes);
+    assert!(profile.host_weight_alloc_ms > 0.);
+    assert!(profile.host_weight_write_ms > 0.);
 }
