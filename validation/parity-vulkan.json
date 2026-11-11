@@ -1,0 +1,17 @@
+{
+  "device": "vulkan",
+  "tokens": [
+    1,
+    5,
+    2,
+    9
+  ],
+  "max_absolute_error_by_prefix": [
+    1.7881393432617188e-07,
+    1.6391277313232422e-07,
+    2.086162567138672e-07,
+    1.1920928955078125e-07
+  ],
+  "passed": true,
+  "reference": "independent NumPy synthetic 2-layer Qwen3 MoE, not pretrained 30B weights"
+}

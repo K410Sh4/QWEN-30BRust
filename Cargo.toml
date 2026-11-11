@@ -1,0 +1,24 @@
+[package]
+name = "qwen-rust"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Experimental native Qwen3 MoE GGUF inference with Rust and Vulkan compute"
+
+[dependencies]
+anyhow = "1"
+bytemuck = "1"
+clap = { version = "4", features = ["derive"] }
+half = "2"
+memmap2 = "0.9"
+pollster = "0.3"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+wgpu = "=0.19.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+

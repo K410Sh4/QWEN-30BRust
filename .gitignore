@@ -1,0 +1,5 @@
+/target/
+/models/
+/test-output/
+*.gguf
+*.safetensors

@@ -1,0 +1,19 @@
+{
+  "config": {
+    "eps": 9.999999974752427e-7,
+    "experts": 128,
+    "head_dim": 128,
+    "heads": 32,
+    "hidden": 2048,
+    "intermediate": 768,
+    "kvheads": 4,
+    "layers": 48,
+    "max_context": 262144,
+    "theta": 10000000.0,
+    "top": 8,
+    "vocab": 151936
+  },
+  "kv_f32_bytes_at_context": 805306368,
+  "packed_weight_bytes": 18550716416,
+  "tensor_count": 579
+}
