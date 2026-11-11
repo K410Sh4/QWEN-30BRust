@@ -555,11 +555,8 @@ impl Graph {
                 for (slot, &(expert, _)) in selected.iter().enumerate() {
                     let (data, kind, rows, cols) = matrix(m, &name, Some(expert))?;
                     let stride = padded(data.len());
-                    let w = v.upload_weight(
-                        (data.as_ptr() as usize, data.len()),
-                        data,
-                        Some(&mut e),
-                    )?;
+                    let w =
+                        v.upload_weight((data.as_ptr() as usize, data.len()), data, Some(&mut e))?;
                     e.copy_buffer_to_buffer(
                         &w,
                         0,

@@ -691,7 +691,9 @@ mod recycling_tests {
         let a = vec![1f32; 150000];
         let b = vec![2f32; 150000];
         let c = vec![3f32; 150000];
-        let old = v.upload_weight((1, 1), bytemuck::cast_slice(&a), None).unwrap();
+        let old = v
+            .upload_weight((1, 1), bytemuck::cast_slice(&a), None)
+            .unwrap();
         let out = staging(&v, old.size());
         let mut encoder = v
             .device
@@ -699,14 +701,18 @@ mod recycling_tests {
         encoder.copy_buffer_to_buffer(&old, 0, &out, 0, old.size());
         drop(old);
         // Same-sized oldest buffer is still referenced by an unsubmitted copy.
-        let second = v.upload_weight((2, 2), bytemuck::cast_slice(&b), None).unwrap();
+        let second = v
+            .upload_weight((2, 2), bytemuck::cast_slice(&b), None)
+            .unwrap();
         drop(second);
         assert_eq!(v.stats.weight_buffer_allocations, 2);
         assert_eq!(v.stats.weight_buffer_reuses, 0);
         v.submit_commands(encoder);
         assert_eq!(v.read_buffer(&out).unwrap(), a);
         // Now B was uploaded by the completed submission and has no external owner.
-        let third = v.upload_weight((3, 3), bytemuck::cast_slice(&c), None).unwrap();
+        let third = v
+            .upload_weight((3, 3), bytemuck::cast_slice(&c), None)
+            .unwrap();
         assert_eq!(v.stats.weight_buffer_allocations, 2);
         assert_eq!(v.stats.weight_buffer_reuses, 1);
         let out = staging(&v, third.size());
@@ -722,7 +728,9 @@ mod recycling_tests {
     fn held_owner_and_size_mismatch_prevent_reuse() {
         let mut v = gpu();
         let a = vec![1f32; 150000];
-        let held = v.upload_weight((1, 1), bytemuck::cast_slice(&a), None).unwrap();
+        let held = v
+            .upload_weight((1, 1), bytemuck::cast_slice(&a), None)
+            .unwrap();
         let out = staging(&v, held.size());
         let mut encoder = v
             .device
@@ -730,7 +738,9 @@ mod recycling_tests {
         encoder.copy_buffer_to_buffer(&held, 0, &out, 0, held.size());
         v.submit_commands(encoder);
         v.read_buffer(&out).unwrap();
-        let second = v.upload_weight((2, 2), bytemuck::cast_slice(&a), None).unwrap();
+        let second = v
+            .upload_weight((2, 2), bytemuck::cast_slice(&a), None)
+            .unwrap();
         drop(second);
         assert_eq!(v.stats.weight_buffer_reuses, 0);
         drop(held);
@@ -741,7 +751,8 @@ mod recycling_tests {
         v.submit_commands(encoder);
         v.read_buffer(&out).unwrap();
         let b = vec![2f32; 160000];
-        v.upload_weight((3, 3), bytemuck::cast_slice(&b), None).unwrap();
+        v.upload_weight((3, 3), bytemuck::cast_slice(&b), None)
+            .unwrap();
         assert_eq!(v.stats.weight_buffer_reuses, 0);
         assert_eq!(v.stats.weight_buffer_allocations, 3);
     }
