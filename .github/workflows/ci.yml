@@ -1,7 +1,7 @@
 name: Rust and Vulkan validation
 on:
   push:
-    branches: [main, 'perf/**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -33,6 +33,15 @@ jobs:
             if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
           }
       - run: cargo build --release --locked
+      - name: Smoke test Windows PowerShell helpers
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          . .\scripts\Common.ps1
+          $modelPath = Resolve-QwenModel -Model 'tests\data\tiny-qwen3moe.gguf'
+          $enginePath = Build-QwenEngine
+          & $enginePath logits --model $modelPath --tokens 1,5 --ctx 8 --device cpu
+          if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell helper smoke test failed' }
   vulkan-software:
     runs-on: ubuntu-latest
     env:

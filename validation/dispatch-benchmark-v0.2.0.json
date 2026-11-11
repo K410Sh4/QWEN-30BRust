@@ -17,14 +17,14 @@
       "software": true,
       "weight_cache_budget_bytes": 134217728
     },
-    "cold_seconds": 1.440879893,
+    "cold_seconds": 1.394324814,
     "cold_stats": {
       "cache_evictions": 0,
       "cache_hits": 3393,
       "cache_misses": 2179,
       "device_forward_ms": 0.0,
       "gpu_dispatches": 5572,
-      "matvec_ms": 1427.130740000003,
+      "matvec_ms": 1382.3236890000042,
       "matvecs": 5572,
       "readback_bytes": 790528,
       "readbacks": 5572,
@@ -34,7 +34,7 @@
     },
     "context": 16,
     "device_resident": false,
-    "forward_tokens_per_second": 3.285077979719223,
+    "forward_tokens_per_second": 3.0963471797048276,
     "input_tokens": [
       1,
       5,
@@ -42,11 +42,11 @@
       9
     ],
     "measured_seconds": [
-      1.316172399,
-      1.2698668149999999,
-      1.157010816,
-      1.217627108,
-      1.203569849
+      1.465900269,
+      1.326942828,
+      1.291844799,
+      1.185316534,
+      1.252874935
     ],
     "measured_stats": [
       {
@@ -55,7 +55,7 @@
         "cache_misses": 0,
         "device_forward_ms": 0.0,
         "gpu_dispatches": 5572,
-        "matvec_ms": 1301.73373799999,
+        "matvec_ms": 1451.9273790000066,
         "matvecs": 5572,
         "readback_bytes": 790528,
         "readbacks": 5572,
@@ -69,7 +69,7 @@
         "cache_misses": 0,
         "device_forward_ms": 0.0,
         "gpu_dispatches": 5572,
-        "matvec_ms": 1258.5399810000345,
+        "matvec_ms": 1313.7769250000247,
         "matvecs": 5572,
         "readback_bytes": 790528,
         "readbacks": 5572,
@@ -83,7 +83,7 @@
         "cache_misses": 0,
         "device_forward_ms": 0.0,
         "gpu_dispatches": 5572,
-        "matvec_ms": 1147.3850210000064,
+        "matvec_ms": 1278.8109309999727,
         "matvecs": 5572,
         "readback_bytes": 790528,
         "readbacks": 5572,
@@ -97,7 +97,7 @@
         "cache_misses": 0,
         "device_forward_ms": 0.0,
         "gpu_dispatches": 5572,
-        "matvec_ms": 1208.4355180000039,
+        "matvec_ms": 1174.3571769999753,
         "matvecs": 5572,
         "readback_bytes": 790528,
         "readbacks": 5572,
@@ -111,7 +111,7 @@
         "cache_misses": 0,
         "device_forward_ms": 0.0,
         "gpu_dispatches": 5572,
-        "matvec_ms": 1194.1291870000132,
+        "matvec_ms": 1242.2363199999445,
         "matvecs": 5572,
         "readback_bytes": 790528,
         "readbacks": 5572,
@@ -120,12 +120,12 @@
         "workspace_allocations": 22288
       }
     ],
-    "median_seconds": 1.217627108,
+    "median_seconds": 1.291844799,
     "version": "0.2.0",
     "warmup_runs": 1,
-    "weight_cache_note": "KV is reset per cycle; model weights stay cached within a mode. Cold includes graph allocation/shader setup on the first token."
+    "weight_cache_note": "KV reset per cycle; weight cache retained per mode. Cold includes graph setup."
   },
-  "reference_over_resident_ratio": 2.4912853205207517,
+  "reference_over_resident_ratio": 2.54671603336762,
   "resident": {
     "backend": {
       "adapter": "llvmpipe (LLVM 19.1.7, 256 bits)",
@@ -135,24 +135,24 @@
       "software": true,
       "weight_cache_budget_bytes": 134217728
     },
-    "cold_seconds": 0.633941664,
+    "cold_seconds": 0.557629148,
     "cold_stats": {
       "cache_evictions": 0,
       "cache_hits": 3393,
       "cache_misses": 2179,
-      "device_forward_ms": 618.488504,
+      "device_forward_ms": 544.020624,
       "gpu_dispatches": 3656,
       "matvec_ms": 0.0,
       "matvecs": 5572,
       "readback_bytes": 102400,
       "readbacks": 196,
-      "submissions": 388,
+      "submissions": 196,
       "uploaded_bytes": 9740288,
       "workspace_allocations": 319
     },
     "context": 16,
     "device_resident": true,
-    "forward_tokens_per_second": 8.184066547640468,
+    "forward_tokens_per_second": 7.885517007426897,
     "input_tokens": [
       1,
       5,
@@ -160,24 +160,24 @@
       9
     ],
     "measured_seconds": [
-      0.528882649,
-      0.488754579,
-      0.488543652,
-      0.4766045,
-      0.515868614
+      0.551703784,
+      0.504985082,
+      0.507259067,
+      0.526390988,
+      0.461478165
     ],
     "measured_stats": [
       {
         "cache_evictions": 0,
         "cache_hits": 5572,
         "cache_misses": 0,
-        "device_forward_ms": 528.8736960000001,
+        "device_forward_ms": 551.6932980000001,
         "gpu_dispatches": 3656,
         "matvec_ms": 0.0,
         "matvecs": 5572,
         "readback_bytes": 102400,
         "readbacks": 196,
-        "submissions": 388,
+        "submissions": 196,
         "uploaded_bytes": 0,
         "workspace_allocations": 0
       },
@@ -185,13 +185,13 @@
         "cache_evictions": 0,
         "cache_hits": 5572,
         "cache_misses": 0,
-        "device_forward_ms": 488.74615600000016,
+        "device_forward_ms": 504.97452699999985,
         "gpu_dispatches": 3656,
         "matvec_ms": 0.0,
         "matvecs": 5572,
         "readback_bytes": 102400,
         "readbacks": 196,
-        "submissions": 388,
+        "submissions": 196,
         "uploaded_bytes": 0,
         "workspace_allocations": 0
       },
@@ -199,13 +199,13 @@
         "cache_evictions": 0,
         "cache_hits": 5572,
         "cache_misses": 0,
-        "device_forward_ms": 488.53499899999997,
+        "device_forward_ms": 507.2494419999998,
         "gpu_dispatches": 3656,
         "matvec_ms": 0.0,
         "matvecs": 5572,
         "readback_bytes": 102400,
         "readbacks": 196,
-        "submissions": 388,
+        "submissions": 196,
         "uploaded_bytes": 0,
         "workspace_allocations": 0
       },
@@ -213,13 +213,13 @@
         "cache_evictions": 0,
         "cache_hits": 5572,
         "cache_misses": 0,
-        "device_forward_ms": 476.59498600000006,
+        "device_forward_ms": 526.3802029999997,
         "gpu_dispatches": 3656,
         "matvec_ms": 0.0,
         "matvecs": 5572,
         "readback_bytes": 102400,
         "readbacks": 196,
-        "submissions": 388,
+        "submissions": 196,
         "uploaded_bytes": 0,
         "workspace_allocations": 0
       },
@@ -227,20 +227,20 @@
         "cache_evictions": 0,
         "cache_hits": 5572,
         "cache_misses": 0,
-        "device_forward_ms": 515.8597220000001,
+        "device_forward_ms": 461.4689910000002,
         "gpu_dispatches": 3656,
         "matvec_ms": 0.0,
         "matvecs": 5572,
         "readback_bytes": 102400,
         "readbacks": 196,
-        "submissions": 388,
+        "submissions": 196,
         "uploaded_bytes": 0,
         "workspace_allocations": 0
       }
     ],
-    "median_seconds": 0.488754579,
+    "median_seconds": 0.507259067,
     "version": "0.2.0",
     "warmup_runs": 1,
-    "weight_cache_note": "KV is reset per cycle; model weights stay cached within a mode. Cold includes graph allocation/shader setup on the first token."
+    "weight_cache_note": "KV reset per cycle; weight cache retained per mode. Cold includes graph setup."
   }
 }

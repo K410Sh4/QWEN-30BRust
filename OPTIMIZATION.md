@@ -2,13 +2,15 @@
 
 ## Implementado sem aproximações adicionais
 
-1. **Estado residente:** cada token entra com a linha de embedding; ativações e KV ficam na GPU. Por camada, a CPU recebe apenas os 128 logits do router, escolhe os oito especialistas e providencia seus pesos. Ao final, recebe os logits do vocabulário.
+1. **Estado residente:** cada token entra com a linha de embedding; ativações e KV ficam na GPU. Por camada, a CPU recebe apenas os 128 logits do router, escolhe os oito especialistas e providencia seus pesos. Ao final, recebe os logits do vocabulário. O lote de especialistas e a atenção seguinte compartilham o mesmo encoder até a próxima decisão de roteamento.
 2. **Especialistas em lote:** cópias entre buffers GPU juntam os pesos selecionados em três bancos reutilizáveis. Gate/up/down usam a dimensão Z do dispatch para oito especialistas. Os resultados são combinados na GPU com as probabilidades renormalizadas.
 3. **Precisão:** normalizações, atenção, KV e ativações permanecem FP32. Os pesos continuam na quantização do arquivo original. A ordem paralela das somas pode alterar números; asserções usam tolerâncias, não igualdade binária.
 4. **Alocações:** buffers de trabalho e uniformes de formato persistem. Os parâmetros de posição são escritos uma vez por token. Misses do cache de pesos ainda podem alocar buffers; não há promessa de zero alocações totais.
 5. **LRU:** heap de idades com verificação de entradas antigas e compactação. A contabilidade cobre os buffers no cache. Comandos já submetidos podem manter recursos expulsos vivos até terminarem; o orçamento não é um limite rígido de consumo total da GPU.
 6. **Prefill:** as projeções de vocabulário e readbacks finais são omitidos nos tokens intermediários. O último token produz os logits necessários à geração. As camadas de atenção ainda são processadas sequencialmente token a token.
 7. **Amostragem:** greedy usa busca linear; top-k usa seleção parcial. O subconjunto final mantém a ordenação e a mesma sequência pseudoaleatória da referência.
+
+O `Model` exige reset antes de alternar entre KV na CPU e KV residente; recusa a troca em uma sequência ativa para evitar histórico incompleto.
 
 ## Contadores
 
@@ -24,7 +26,7 @@
 | `matvec_ms` | Tempo de parede de matvec no caminho de referência; inclui espera e transferências. Zero no grafo residente. |
 | `device_forward_ms` | Tempo de parede do token no grafo residente; inclui roteamento CPU e transferências. Não é tempo puro dos kernels. |
 
-No 30B de 48 camadas/top-8, com tensores cabendo nos limites por binding e solicitando logits: 1393 matrizes lógicas, 385 dispatches de matvec e 529 operações vetoriais/atenção = 914 dispatches no modo residente. Há 97 submissions explícitas e 49 readbacks. O modo referência usa 1393 submissions/readbacks. O prefill intermediário residente omite a última submission/readback e a projeção final. Tiling e configurações diferentes alteram esses números.
+No 30B de 48 camadas/top-8, com tensores cabendo nos limites por binding e solicitando logits: 1393 matrizes lógicas, 385 dispatches de matvec e 529 operações vetoriais/atenção = 914 dispatches no modo residente. Há 49 submissions explícitas e 49 readbacks. O modo referência usa 1393 submissions/readbacks. O prefill intermediário residente mantém 49 submissions, executa 48 readbacks e omite a normalização/projeção final do vocabulário. Tiling e configurações diferentes alteram esses números.
 
 ## O que continua limitando o desempenho
 

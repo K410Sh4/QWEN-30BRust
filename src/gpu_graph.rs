@@ -393,13 +393,15 @@ impl Graph {
             0,
             bytemuck::cast_slice(&m.row("token_embd.weight", token as usize)?),
         );
+        // Carry the expert batch into the next attention/router submission.
+        // Only router readbacks and final logits require a queue boundary.
+        let mut e = v
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("resident token graph"),
+            });
         for i in 0..c.layers {
             let base = format!("blk.{i}");
-            let mut e = v
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("attention and routing"),
-                });
             self.op(
                 v,
                 &mut e,
@@ -517,10 +519,10 @@ impl Graph {
             let rates: Vec<f32> = selected.iter().map(|v| v.1).collect();
             v.queue
                 .write_buffer(&self.rates, 0, bytemuck::cast_slice(&rates));
-            let mut e = v
+            e = v
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("batched experts"),
+                    label: Some("experts and next attention"),
                 });
             let mut shapes = Vec::new();
             for (bank, name) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
@@ -597,18 +599,13 @@ impl Graph {
                 &[(1, &self.down), (2, &self.rates), (3, &self.x)],
                 c.hidden.div_ceil(64) as u32,
             );
-            Self::submit(v, e);
         }
         if !want_logits {
+            Self::submit(v, e);
             self.position = pos + 1;
             v.stats.device_forward_ms += started.elapsed().as_secs_f64() * 1000.;
             return Ok(Vec::new());
         }
-        let mut e = v
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("language model head"),
-            });
         self.op(
             v,
             &mut e,

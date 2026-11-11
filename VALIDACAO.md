@@ -23,16 +23,16 @@ Perfil: hidden 32, 48 camadas, 128 especialistas/top-8, FF 32, Q 8 cabeças × d
 
 | Medida por ciclo de quatro tokens | Referência | Residente |
 | --- | ---: | ---: |
-| Mediana de cinco ciclos | 1.217627 s | 0.488755 s |
-| Forwards/s nessa carga sintética | 3.285 | 8.184 |
+| Mediana de cinco ciclos | 1.291845 s | 0.507259 s |
+| Forwards/s nessa carga sintética | 3.096 | 7.886 |
 | Matrizes lógicas | 5572 | 5572 |
 | Dispatches GPU totais | 5572 | 3656 |
-| Submissions explícitas | 5572 | 388 |
+| Submissions explícitas | 5572 | 196 |
 | Readbacks síncronos | 5572 | 196 |
 | Bytes retornados à CPU | 790528 | 102400 |
 | Alocações explícitas de buffers de trabalho | 22288 | 0 |
 
-Razão entre medianas: **2.491×** nesse ambiente e carga. Readbacks por token: 1393 → 49, redução de 96.48%. Os números são evidência local da mudança de execução, não promessa de aceleração na RX 5700 XT. Variações entre execuções são esperadas no driver por software.
+Razão entre medianas: **2.547×** nesse ambiente e carga. Readbacks por token: 1393 → 49, redução de 96.48%. Os números são evidência local da mudança de execução, não promessa de aceleração na RX 5700 XT. Variações entre execuções são esperadas no driver por software.
 
 O caminho de referência é o modo diagnóstico do mesmo executável 0.2, com atenção/vetores CPU e readback por matriz, como na execução 0.1. Ele também recebe a melhoria geral de cache LRU; não é uma cópia binária do executável 0.1.
 
@@ -54,7 +54,7 @@ Dados completos: [dispatch-benchmark-v0.2.0.json](validation/dispatch-benchmark-
 12. CLI de chat, tokenizer e marcadores de controle.
 13. Forward residente contra NumPy e troca de modelo.
 14. Prefill sem projeção preservando estado causal.
-15. Buffers persistentes, readbacks, cache com orçamento zero e limite de KV.
+15. Buffers persistentes, submissions/readbacks, cache com orçamento zero, limite de KV e recusa de troca de local de KV sem reset.
 16. Tensores quantizados misturados comparados entre CPU, Vulkan referência e residente, com expulsão de pesos.
 17. Atenção com 80 posições, incluindo a transição de 64 posições.
 18. CLI de benchmark e contagem de forwards medidos.

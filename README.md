@@ -49,6 +49,7 @@ O teste executa os modos de referência e residente, **um por vez**, com o mesmo
 | Cache KV FP32 | RAM | VRAM |
 | Matrizes dos 8 especialistas por camada | 24 dispatches separados | 3 dispatches com dimensão de lote |
 | Leituras síncronas para um token com logits no 30B de 48 camadas | 1393 | 49: 48 routers e logits finais |
+| Envios explícitos por token com logits | 1393 | 49 |
 | Buffers de trabalho | Recriados por matriz | Reutilizados entre tokens |
 | Projeção do vocabulário durante prefill | Calculada por token | Calculada só no último token |
 | Amostragem top-k | Ordenação de todo o vocabulário | Seleção parcial e ordenação do subconjunto |

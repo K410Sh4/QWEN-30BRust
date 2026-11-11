@@ -152,8 +152,9 @@ fn resident_state_and_counters() {
         for (a, b) in actual.iter().zip(&expected[2]) {
             assert!((a - b).abs() < 2e-5);
         }
-        assert_eq!(gpu.stats().readbacks, 7); // 3*2 routers + 1 final logits.
-                                              // The only extra persistent object is the LM-head matrix-shape uniform.
+        assert_eq!(gpu.stats().readbacks, 7);
+        assert_eq!(gpu.stats().submissions, 9); // 3*2 routers + 1 final logits.
+                                                // The only extra persistent object is the LM-head matrix-shape uniform.
         assert!(gpu.stats().workspace_allocations <= allocations + 1);
         m.reset();
         let actual = m.forward(1, &mut gpu).unwrap();
@@ -161,6 +162,20 @@ fn resident_state_and_counters() {
             assert!((a - b).abs() < 2e-5);
         }
     }
+    // Switching a live Model to the other KV location must fail and reset,
+    // rather than silently treating the current token as an empty history.
+    let mut gpu = Vulkan::new(1, None, allow).unwrap();
+    let mut cpu = Cpu::default();
+    let mut m = Model::new(Gguf::open(&fixture()).unwrap(), 8).unwrap();
+    m.forward(1, &mut gpu).unwrap();
+    assert!(m
+        .forward(5, &mut cpu)
+        .unwrap_err()
+        .to_string()
+        .contains("reset the model"));
+    assert_eq!(m.position, 0);
+    m.forward(1, &mut cpu).unwrap();
+    assert!(m.forward(5, &mut gpu).is_err());
     let mut gpu = Vulkan::new(0, None, allow)
         .unwrap()
         .kv_budget_mib(0)

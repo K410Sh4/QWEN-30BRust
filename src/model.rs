@@ -168,6 +168,7 @@ pub struct Model {
     output_norm: Vec<f32>,
     pub position: usize,
     context: usize,
+    device_state: Option<bool>,
 }
 impl Model {
     pub fn new(gguf: Gguf, context: usize) -> Result<Self> {
@@ -197,6 +198,7 @@ impl Model {
             output_norm,
             position: 0,
             context,
+            device_state: None,
         })
     }
     pub fn reset(&mut self) {
@@ -205,6 +207,7 @@ impl Model {
             c.v.clear();
         }
         self.position = 0;
+        self.device_state = None;
     }
     /// Single-token causal forward. On error the cache is rolled back to a clean state.
     pub fn forward(&mut self, token: u32, backend: &mut dyn Backend) -> Result<Vec<f32>> {
@@ -239,6 +242,12 @@ impl Model {
             self.context
         );
         ensure!((token as usize) < c.vocab, "token outside vocabulary");
+        let resident = b.device_resident();
+        ensure!(
+            self.position == 0 || self.device_state == Some(resident),
+            "reset the model before switching between CPU and device-resident KV state"
+        );
+        self.device_state = Some(resident);
         if let Some(logits) = b.forward_device(
             &self.gguf,
             c,
