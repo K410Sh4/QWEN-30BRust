@@ -123,8 +123,8 @@ impl GpuProfile {
         rx.recv()??;
         {
             let data = slice.get_mapped_range();
-            let ticks = bytemuck::cast_slice::<u8, u64>(&data);
-            for (&stage, pair) in self.stages.iter().zip(ticks.chunks_exact(2)) {
+            let ticks = bytemuck::cast_slice::<u8, [u64; 2]>(&data);
+            for (&stage, pair) in self.stages.iter().zip(ticks) {
                 let ms = pair[1].saturating_sub(pair[0]) as f64 * self.ns_per_tick / 1_000_000.;
                 match stage {
                     Stage::Attention => stats.gpu_attention_ms += ms,
