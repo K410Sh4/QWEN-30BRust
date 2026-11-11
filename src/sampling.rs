@@ -28,14 +28,17 @@ impl Sampler {
             !logits.is_empty() && logits.iter().all(|v| v.is_finite()),
             "invalid logits"
         );
-        let mut ids: Vec<_> = (0..logits.len()).collect();
-        ids.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
+        let order = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b));
         if self.temperature == 0. {
-            return Ok(ids[0] as u32);
+            let id = (0..logits.len()).min_by(order).unwrap();
+            return Ok(id as u32);
         }
-        if self.top_k > 0 {
-            ids.truncate(self.top_k.min(ids.len()));
+        let mut ids: Vec<_> = (0..logits.len()).collect();
+        if self.top_k > 0 && self.top_k < ids.len() {
+            ids.select_nth_unstable_by(self.top_k, order);
+            ids.truncate(self.top_k);
         }
+        ids.sort_unstable_by(order);
         let max = logits[ids[0]];
         let mut probs: Vec<f32> = ids
             .iter()

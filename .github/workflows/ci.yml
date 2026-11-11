@@ -1,0 +1,58 @@
+name: Rust and Vulkan validation
+on:
+  push:
+    branches: [main, 'perf/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: qwen-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+      - run: rustup default stable
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - name: Parse PowerShell scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse -Filter *.ps1 | Where-Object { $_.FullName -notmatch '[\\/]target[\\/]' } | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+          }
+      - run: cargo build --release --locked
+  vulkan-software:
+    runs-on: ubuntu-latest
+    env:
+      XDG_RUNTIME_DIR: /tmp
+      QWEN_TEST_ALLOW_SOFTWARE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers vulkan-tools
+      - run: rustup toolchain install stable --profile minimal
+      - run: rustup default stable
+      - run: cargo test --locked -- --include-ignored
+      - run: cargo build --release --locked
+      - run: python -m pip install numpy
+      - run: python tools/reference_fixture.py --out test-output --binary target/release/qwen-rust --device vulkan --allow-software
+      - run: python tools/reference_fixture.py --out test-output/dispatch --profile dispatch
+      - name: Compare reference and resident execution
+        run: target/release/qwen-rust bench --model test-output/dispatch/tiny-qwen3moe.gguf --tokens 1,5,2,9 --ctx 16 --gpu-cache-mib 128 --compare --warmup 1 --runs 3 --allow-software > test-output/dispatch-comparison.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: software-vulkan-parity-and-comparison
+          path: |
+            test-output/parity-vulkan.json
+            test-output/dispatch-comparison.json

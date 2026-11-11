@@ -208,13 +208,30 @@ impl Model {
     }
     /// Single-token causal forward. On error the cache is rolled back to a clean state.
     pub fn forward(&mut self, token: u32, backend: &mut dyn Backend) -> Result<Vec<f32>> {
-        let result = self.forward_inner(token, backend);
+        self.forward_mode(token, backend, true)
+    }
+    /// Advance the causal state without computing an unused vocabulary projection.
+    pub fn forward_without_logits(&mut self, token: u32, backend: &mut dyn Backend) -> Result<()> {
+        self.forward_mode(token, backend, false).map(|_| ())
+    }
+    fn forward_mode(
+        &mut self,
+        token: u32,
+        backend: &mut dyn Backend,
+        logits: bool,
+    ) -> Result<Vec<f32>> {
+        let result = self.forward_inner(token, backend, logits);
         if result.is_err() {
             self.reset();
         }
         result
     }
-    fn forward_inner(&mut self, token: u32, b: &mut dyn Backend) -> Result<Vec<f32>> {
+    fn forward_inner(
+        &mut self,
+        token: u32,
+        b: &mut dyn Backend,
+        want_logits: bool,
+    ) -> Result<Vec<f32>> {
         let c = &self.config;
         ensure!(
             self.position < self.context,
@@ -222,6 +239,21 @@ impl Model {
             self.context
         );
         ensure!((token as usize) < c.vocab, "token outside vocabulary");
+        if let Some(logits) = b.forward_device(
+            &self.gguf,
+            c,
+            token,
+            self.position,
+            self.context,
+            want_logits,
+        )? {
+            ensure!(
+                logits.iter().all(|v| v.is_finite()),
+                "nonfinite GPU model output"
+            );
+            self.position += 1;
+            return Ok(logits);
+        }
         let mut x = self.gguf.row("token_embd.weight", token as usize)?;
         for i in 0..c.layers {
             let base = format!("blk.{i}");
@@ -285,6 +317,10 @@ impl Model {
             for (v, m) in x.iter_mut().zip(moe) {
                 *v += m;
             }
+        }
+        if !want_logits {
+            self.position += 1;
+            return Ok(Vec::new());
         }
         ops::rms(&mut x, &self.output_norm, c.eps)?;
         let out = if self.gguf.tensors.contains_key("output.weight") {

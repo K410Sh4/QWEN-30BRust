@@ -1,76 +1,69 @@
-# Validação — Qwen Rust 0.1.0
+# Validação — Qwen Rust 0.2.0
 
-Data: 10/11/2026. Ambiente: Linux x86_64, Rust 1.99.1, Cargo.lock incluído. Vulkan de teste: Mesa llvmpipe, LLVM 19.1.7, dispositivo classificado como CPU. Não havia uma RX 5700 XT acessível.
+Data: 10/11/2026. Ambiente local: Linux x86_64, Rust 1.99.1, Mesa llvmpipe/LLVM 19.1.7, Vulkan **por software**. Não houve acesso à RX 5700 XT do operador.
 
-## Resultados
+## Resultado local
 
-| Verificação | Resultado | Alcance |
-| --- | --- | --- |
-| `cargo build --release --locked` | Passou | Compilação Linux otimizada |
-| `cargo fmt --check` | Passou | Código Rust |
-| `cargo clippy --locked --all-targets -- -D warnings` | Passou | Código e testes Rust |
-| `cargo test --locked` | 9 passaram; 3 Vulkan ignorados por padrão | CPU, quantização, modelo, GGUF e CLI |
-| `cargo test --locked -- --ignored` com Vulkan software explícito | 3 passaram | Shaders, cache, grid e forward sintético |
-| Referência independente NumPy / CPU release | Passou | Quatro prefixos de 1–4 tokens, modelo sintético de duas camadas |
-| Referência independente NumPy / Vulkan release | Passou | Mesmo modelo sintético, kernels executados em llvmpipe |
-| Cabeçalho real `qwen3-coder:30b` | Passou | 579 tensores, dimensões, tipos suportados e limites do arquivo |
-| Tokenizer oficial vs tabela do GGUF real | Passou | Correspondência de tokens; teste interrompido antes do forward por limite deliberado de contexto |
-| Compilação/executável Windows e scripts PowerShell | Pendente | Não houve Windows/PowerShell neste ambiente |
-| Geração com pesos treinados reais de 30B | Pendente | Não executada |
-| Benchmark de desempenho na RX 5700 XT | Pendente | Não executado |
+- Compilação release passou, com Cargo.lock.
+- Formatação e Clippy com `-D warnings` passaram.
+- **18 testes passaram**, incluindo 12 CPU e 6 Vulkan habilitados explicitamente.
+- Comparação NumPy independente dos quatro prefixos sintéticos de duas camadas: maior erro absoluto GPU 2.38418579e-07.
+- O benchmark residente de 48 camadas passou na comparação de todos os logits com o caminho de referência. Maior erro absoluto: 9.53674316e-07; escolhas greedy iguais.
+- A CI inclui Linux, Windows, parsing de PowerShell e testes Vulkan por software. Consulte o status do commit/PR para o resultado remoto; a aprovação da CI não é benchmark do hardware do operador.
 
-## Erro numérico observado
+## Benchmark sintético de 48 camadas
 
-Modelo de teste: duas camadas, hidden 8, 4 cabeças Q, 2 cabeças KV, dimensão de cabeça 4, 4 especialistas, top-2 e vocabulário 16. Pesos FP32 aleatórios com seed fixa. O tamanho Q é diferente do hidden, como também ocorre no Qwen3-Coder-30B.
+Comando executado em release:
 
-| Prefixo de tokens | Maior erro absoluto CPU | Maior erro absoluto Vulkan software |
-| --- | --- | --- |
-| `[1]` | 1,1921 × 10⁻⁷ | 1,7881 × 10⁻⁷ |
-| `[1,5]` | 1,4901 × 10⁻⁷ | 1,6391 × 10⁻⁷ |
-| `[1,5,2]` | 1,7881 × 10⁻⁷ | 2,0862 × 10⁻⁷ |
-| `[1,5,2,9]` | 2,3842 × 10⁻⁷ | 1,1921 × 10⁻⁷ |
+```text
+qwen-rust bench --model test-output/dispatch/tiny-qwen3moe.gguf --tokens 1,5,2,9 --ctx 16 --gpu-cache-mib 128 --compare --warmup 1 --runs 5 --allow-software
+```
 
-Asserção utilizada: `rtol=2e-4`, `atol=2e-5`. Não se pode extrapolar esse erro para 48 camadas, contexto longo e pesos reais quantizados sem uma comparação específica.
+Perfil: hidden 32, 48 camadas, 128 especialistas/top-8, FF 32, Q 8 cabeças × dimensão 8, KV 2 cabeças, vocabulário 256. Pesos FP32 aleatórios, não treinados. O arquivo tem cerca de 74 MiB; o conjunto de pesos acessado nesses prefixos cabe no cache de 128 MiB. Ambos os modos medidos tiveram **zero uploads de pesos** depois do aquecimento. Isso é favorável ao cache e não representa necessariamente o 30B maior que a VRAM.
 
-## Testes cobertos
+| Medida por ciclo de quatro tokens | Referência | Residente |
+| --- | ---: | ---: |
+| Mediana de cinco ciclos | 1.217627 s | 0.488755 s |
+| Forwards/s nessa carga sintética | 3.285 | 8.184 |
+| Matrizes lógicas | 5572 | 5572 |
+| Dispatches GPU totais | 5572 | 3656 |
+| Submissions explícitas | 5572 | 388 |
+| Readbacks síncronos | 5572 | 196 |
+| Bytes retornados à CPU | 790528 | 102400 |
+| Alocações explícitas de buffers de trabalho | 22288 | 0 |
 
-1. Seleção top-k dos especialistas, pesos renormalizados e recusa de logits inválidos.
-2. Rotação NeoX com pares entre metades do vetor.
-3. Mapeamento GQA de cabeças Q para KV.
-4. Amostragem greedy, seed reproduzível e parâmetros inválidos.
-5. Recusa de tipos e dimensões quantizadas incompatíveis.
-6. Layouts F32, F16, Q4_0, Q8_0, Q4_K, Q5_K e Q6_K com escalas/valores não uniformes e blocos consecutivos.
-7. Forward CPU completo comparado com NumPy, cache KV, reset e limite de contexto.
-8. Cabeçalhos malformados, contagens excessivas e arquivos truncados.
-9. CLI de chat com tokenizer compatível e recusa de marcadores especiais no conteúdo.
-10. Matvec Vulkan para os sete formatos e reutilização do cache.
-11. Grid Vulkan com 70.001 linhas e descarte LRU por orçamento.
-12. Forward Vulkan completo contra a referência e invalidação do cache ao trocar de modelo.
+Razão entre medianas: **2.491×** nesse ambiente e carga. Readbacks por token: 1393 → 49, redução de 96.48%. Os números são evidência local da mudança de execução, não promessa de aceleração na RX 5700 XT. Variações entre execuções são esperadas no driver por software.
 
-Os testes de formatos usam equações de referência separadas dos decodificadores de produção, mas não constituem validação de todos os possíveis padrões binários. Não houve comparação dos logits reais com llama.cpp/Transformers nesta versão.
+O caminho de referência é o modo diagnóstico do mesmo executável 0.2, com atenção/vetores CPU e readback por matriz, como na execução 0.1. Ele também recebe a melhoria geral de cache LRU; não é uma cópia binária do executável 0.1.
 
-## Inspeção do GGUF real
+Dados completos: [dispatch-benchmark-v0.2.0.json](validation/dispatch-benchmark-v0.2.0.json). As métricas de prefill do chat omitem as projeções intermediárias descartadas; este benchmark solicita logits em cada prefixo para verificar paridade e não mede essa economia adicional.
 
-Manifesto consultado em `https://registry.ollama.ai/v2/library/qwen3-coder/manifests/30b`:
+## Testes de regressão
 
-- Digest do blob: `sha256:1194192cf2a187eb02722edcc3f77b11d21f537048ce04b67ccf8ba78863006a`.
-- Tamanho total declarado: 18.556.688.736 bytes; pesos compactados: 18.550.716.416 bytes.
-- Arquitetura: `qwen3moe`; camadas: 48; hidden: 2048.
-- Cabeças Q/KV: 32/4; dimensão: 128.
-- Especialistas: 128; escolhidos por token: 8; tamanho interno por especialista: 768.
-- Vocabulário dos embeddings: 151.936; tokenizer oficial: 151.669 tokens.
-- RoPE theta: 10.000.000; contexto nativo informado: 262.144.
-- KV FP32 calculado para contexto 4096: 805.306.368 bytes = 768 MiB de valores.
+1. Seleção e renormalização MoE, valores inválidos.
+2. RoPE NeoX entre metades.
+3. Mapeamento GQA.
+4. Seed, greedy e parâmetros da amostragem.
+5. Top-k parcial contra a distribuição de ordenação completa, incluindo empates.
+6. Dimensões e tipos quantizados inválidos.
+7. Layouts F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K.
+8. Matvec Vulkan desses sete tipos.
+9. Grid com 70.001 linhas e expulsão LRU.
+10. Forward CPU contra NumPy, reset e limites.
+11. Cabeçalhos GGUF malformados e truncados.
+12. CLI de chat, tokenizer e marcadores de controle.
+13. Forward residente contra NumPy e troca de modelo.
+14. Prefill sem projeção preservando estado causal.
+15. Buffers persistentes, readbacks, cache com orçamento zero e limite de KV.
+16. Tensores quantizados misturados comparados entre CPU, Vulkan referência e residente, com expulsão de pesos.
+17. Atenção com 80 posições, incluindo a transição de 64 posições.
+18. CLI de benchmark e contagem de forwards medidos.
 
-A inspeção baixou somente os primeiros 16 MiB via HTTP Range. Um arquivo esparso temporário com o tamanho declarado permitiu verificar offsets e dimensões; o restante era zero e **não foi usado para inferência**. Esse arquivo não faz parte do pacote. A inspeção não valida a integridade de todos os pesos nem o SHA-256 do blob completo.
+## Ainda precisa ser medido no PC
 
-Os metadados atuais do registro podem diferir de um arquivo baixado anteriormente. `inspect` verifica o arquivo efetivamente informado pelo usuário.
+- Executar `Verificar.ps1 -GPU` e `Benchmark.ps1` no Windows com o arquivo real de 30B.
+- Conferir o adaptador físico e a paridade nos logits. O relatório identifica driver/software, orçamento de pesos e KV.
+- Medir também geração natural, tempo até primeiro token, VRAM, RAM, paginação e uploads de pesos. Prefixos fixos quentes podem favorecer o cache.
+- Não foi alterada a quantização dos pesos nem reduzido o número de camadas ou especialistas. FP32 é preservado para ativações/KV, com diferenças de ordem das somas paralelas.
 
-## Critérios ainda necessários para concluir a validação do 30B
-
-1. Executar `Verificar.ps1 -GPU` no PC e confirmar o adaptador físico escolhido.
-2. Executar o arquivo real com tokenizer correspondente e comparar logits de prompts curtos com uma referência do mesmo GGUF.
-3. Medir prefill, tempo até primeiro token, geração, VRAM, RAM e bytes transferidos usando o mesmo contexto e os mesmos pesos da comparação com Ollama.
-4. Só atribuir ganhos às otimizações que tenham passado por essa comparação. A sincronização por matvec e a atenção na CPU são limitações conhecidas da versão 0.1.0.
-
-Os resultados JSON brutos das comparações release e da inspeção estão em `validation/`.
+O histórico da inspeção do cabeçalho real e validação 0.1 permanece em [BASELINE_v0.1.0.md](validation/BASELINE_v0.1.0.md). A geração real da 0.1 foi informada pelo operador; não equivale à validação da nova versão na placa.

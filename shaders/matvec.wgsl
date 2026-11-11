@@ -1,5 +1,5 @@
 // Quantized weights remain packed in GPU memory. No shader-f16 requirement.
-struct Params { cols:u32, rows:u32, kind:u32, row_bytes:u32 };
+struct Params { cols:u32, rows:u32, kind:u32, row_bytes:u32, out_offset:u32, batch_bytes:u32, input_stride:u32, pad:u32 };
 @group(0) @binding(0) var<storage,read> weights:array<u32>;
 @group(0) @binding(1) var<storage,read> input:array<f32>;
 @group(0) @binding(2) var<storage,read_write> output:array<f32>;
@@ -13,8 +13,8 @@ fn scale_at(base:u32,j:u32)->vec2<f32> {
     return vec2<f32>(f32((byte_at(base+j+4u)&15u)|((byte_at(base+j-4u)>>6u)<<4u)),
         f32((byte_at(base+j+4u)>>4u)|((byte_at(base+j)>>6u)<<4u)));
 }
-fn weight(row:u32,col:u32)->f32 {
-    let r=row*p.row_bytes;
+fn weight(row:u32,col:u32,batch:u32)->f32 {
+    let r=batch*p.batch_bytes+row*p.row_bytes;
     if p.kind==0u {return bitcast<f32>(weights[(r+col*4u)/4u]);}
     if p.kind==1u {return half_at(r+col*2u);}
     if p.kind==2u {
@@ -45,10 +45,10 @@ fn main(@builtin(workgroup_id) gid:vec3<u32>, @builtin(local_invocation_id) tid:
     let row=gid.x+gid.y*65535u;
     if row>=p.rows {return;}
     var sum=0.0;
-    for(var col=tid.x;col<p.cols;col+=64u){sum+=weight(row,col)*input[col];}
+    for(var col=tid.x;col<p.cols;col+=64u){sum+=weight(row,col,gid.z)*input[gid.z*p.input_stride+col];}
     sums[tid.x]=sum;workgroupBarrier();
     for(var stride=32u;stride>0u;stride/=2u){
         if tid.x<stride {sums[tid.x]+=sums[tid.x+stride];}workgroupBarrier();
     }
-    if tid.x==0u {output[row]=sums[0];}
+    if tid.x==0u {output[p.out_offset+gid.z*p.rows+row]=sums[0];}
 }

@@ -1,15 +1,28 @@
-use crate::{gguf::Gguf, quant};
+use crate::{gguf::Gguf, model::Config, quant};
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
-use std::{collections::HashMap, sync::mpsc, time::Instant};
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
+    sync::{mpsc, Arc},
+    time::Instant,
+};
 use wgpu::util::DeviceExt;
 
-#[derive(Default, Serialize, Debug)]
+#[derive(Default, Clone, Serialize, Debug)]
 pub struct Stats {
     pub matvecs: u64,
     pub uploaded_bytes: u64,
     pub cache_hits: u64,
     pub matvec_ms: f64,
+    pub gpu_dispatches: u64,
+    pub submissions: u64,
+    pub readbacks: u64,
+    pub readback_bytes: u64,
+    pub cache_misses: u64,
+    pub cache_evictions: u64,
+    pub workspace_allocations: u64,
+    pub device_forward_ms: f64,
 }
 pub trait Backend {
     fn matvec(
@@ -20,6 +33,23 @@ pub trait Backend {
         x: &[f32],
     ) -> Result<Vec<f32>>;
     fn stats(&self) -> &Stats;
+    fn forward_device(
+        &mut self,
+        _m: &Gguf,
+        _c: &Config,
+        _token: u32,
+        _pos: usize,
+        _context: usize,
+        _logits: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        Ok(None)
+    }
+    fn device_resident(&self) -> bool {
+        false
+    }
+    fn metadata(&self) -> serde_json::Value {
+        serde_json::json!({"backend":"cpu"})
+    }
 }
 #[derive(Default)]
 pub struct Cpu {
@@ -73,23 +103,27 @@ pub fn matrix<'a>(
     ensure!(expert.is_none() || e < t.dims[2], "expert out of bounds");
     Ok((&m.data(t)[e * len..(e + 1) * len], t.kind, rows, cols))
 }
-struct Cached {
-    buffer: wgpu::Buffer,
+pub(crate) struct Cached {
+    buffer: Arc<wgpu::Buffer>,
     bytes: u64,
     age: u64,
 }
 pub struct Vulkan {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+    pub(crate) pipeline: wgpu::ComputePipeline,
     cache: HashMap<(usize, usize), Cached>,
     budget: u64,
     used: u64,
     clock: u64,
-    stats: Stats,
+    pub(crate) stats: Stats,
     pub adapter_name: String,
     pub software: bool,
     active_model: usize,
+    lru: BinaryHeap<Reverse<(u64, (usize, usize))>>,
+    pub(crate) graph: Option<crate::gpu_graph::Graph>,
+    pub(crate) graph_enabled: bool,
+    pub(crate) kv_budget: u64,
 }
 impl Vulkan {
     pub fn new(budget_mib: u64, filter: Option<&str>, allow_software: bool) -> Result<Self> {
@@ -157,6 +191,10 @@ impl Vulkan {
             adapter_name: info.name,
             software: info.device_type == wgpu::DeviceType::Cpu,
             active_model: 0,
+            lru: BinaryHeap::new(),
+            graph: None,
+            graph_enabled: true,
+            kv_budget: 1024 * 1024 * 1024,
         })
     }
     pub fn devices() -> Vec<String> {
@@ -212,53 +250,94 @@ impl Vulkan {
             }
             return Ok(output);
         }
+        let weights = self.upload_weight(key, data)?;
+        self.dispatch(&weights, kind, rows, cols, rb, x, start)
+    }
+    pub fn kv_budget_mib(mut self, mib: u64) -> Result<Self> {
+        self.kv_budget = mib
+            .checked_mul(1024 * 1024)
+            .context("GPU KV budget overflow")?;
+        Ok(self)
+    }
+    pub fn reference(mut self, enabled: bool) -> Self {
+        self.graph_enabled = !enabled;
+        self
+    }
+    pub(crate) fn select_model(&mut self, m: &Gguf) {
+        if self.active_model != m.id {
+            self.cache.clear();
+            self.lru.clear();
+            self.used = 0;
+            self.graph = None;
+            self.active_model = m.id;
+        }
+    }
+    /// The key must uniquely identify immutable bytes within the selected model.
+    pub(crate) fn upload_weight(
+        &mut self,
+        key: (usize, usize),
+        data: &[u8],
+    ) -> Result<Arc<wgpu::Buffer>> {
         self.clock += 1;
-        let ephemeral;
-        if self.cache.contains_key(&key) {
+        if let Some(cached) = self.cache.get_mut(&key) {
+            cached.age = self.clock;
             self.stats.cache_hits += 1;
-            self.cache.get_mut(&key).unwrap().age = self.clock;
-        } else {
-            while self.used + bytes > self.budget && !self.cache.is_empty() {
-                let old = *self.cache.iter().min_by_key(|(_, v)| v.age).unwrap().0;
-                self.used -= self.cache.remove(&old).unwrap().bytes;
+            self.lru.push(Reverse((self.clock, key)));
+            let result = Arc::clone(&cached.buffer);
+            self.compact_lru();
+            return Ok(result);
+        }
+        self.stats.cache_misses += 1;
+        let bytes = (data.len() as u64 + 3) & !3;
+        while self.used + bytes > self.budget && !self.cache.is_empty() {
+            let Reverse((age, k)) = self.lru.pop().context("LRU accounting invariant")?;
+            if self.cache.get(&k).map(|c| c.age == age).unwrap_or(false) {
+                self.used -= self.cache.remove(&k).unwrap().bytes;
+                self.stats.cache_evictions += 1;
             }
-            let mut padded = Vec::new();
-            let packed = if !data.len().is_multiple_of(4) {
-                padded.extend_from_slice(data);
-                padded.resize(bytes as usize, 0);
-                &padded[..]
-            } else {
-                data
-            };
-            let buffer = self
-                .device
+        }
+        let mut padded = Vec::new();
+        let packed = if data.len().is_multiple_of(4) {
+            data
+        } else {
+            padded.extend_from_slice(data);
+            padded.resize(bytes as usize, 0);
+            &padded
+        };
+        let buffer = Arc::new(
+            self.device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("packed weights"),
                     contents: packed,
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-            self.stats.uploaded_bytes += bytes;
-            if bytes <= self.budget {
-                self.used += bytes;
-                self.cache.insert(
-                    key,
-                    Cached {
-                        buffer,
-                        bytes,
-                        age: self.clock,
-                    },
-                );
-            } else {
-                ephemeral = buffer;
-                return self.dispatch(&ephemeral, kind, rows, cols, rb, x, start);
-            }
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                }),
+        );
+        self.stats.uploaded_bytes += bytes;
+        if bytes <= self.budget {
+            self.used += bytes;
+            self.cache.insert(
+                key,
+                Cached {
+                    buffer: Arc::clone(&buffer),
+                    bytes,
+                    age: self.clock,
+                },
+            );
+            self.lru.push(Reverse((self.clock, key)));
         }
-        // Temporarily remove to borrow self mutably while retaining the buffer.
-        let cached = self.cache.remove(&key).unwrap();
-        let result = self.dispatch(&cached.buffer, kind, rows, cols, rb, x, start);
-        self.cache.insert(key, cached);
-        result
+        self.compact_lru();
+        Ok(buffer)
     }
+    fn compact_lru(&mut self) {
+        if self.lru.len() > self.cache.len() * 4 + 1024 {
+            self.lru = self
+                .cache
+                .iter()
+                .map(|(&k, v)| Reverse((v.age, k)))
+                .collect();
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn dispatch(
         &mut self,
@@ -270,6 +349,7 @@ impl Vulkan {
         x: &[f32],
         start: Instant,
     ) -> Result<Vec<f32>> {
+        self.stats.workspace_allocations += 4; // input, output, readback, matrix-shape uniform.
         let input = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -294,6 +374,10 @@ impl Vulkan {
             u32::try_from(rows)?,
             kind,
             u32::try_from(rb)?,
+            0,
+            0,
+            0,
+            0,
         ];
         let uniform = self
             .device
@@ -338,6 +422,8 @@ impl Vulkan {
         }
         encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, (rows * 4) as u64);
         self.queue.submit(Some(encoder.finish()));
+        self.stats.submissions += 1;
+        self.stats.gpu_dispatches += 1;
         let slice = readback.slice(..);
         let (tx, rx) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -347,6 +433,8 @@ impl Vulkan {
         rx.recv()??;
         let values = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
         readback.unmap();
+        self.stats.readbacks += 1;
+        self.stats.readback_bytes += (rows * 4) as u64;
         self.stats.matvecs += 1;
         self.stats.matvec_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(values)
@@ -354,11 +442,7 @@ impl Vulkan {
 }
 impl Backend for Vulkan {
     fn matvec(&mut self, m: &Gguf, name: &str, e: Option<usize>, x: &[f32]) -> Result<Vec<f32>> {
-        if self.active_model != m.id {
-            self.cache.clear();
-            self.used = 0;
-            self.active_model = m.id;
-        }
+        self.select_model(m);
         let (data, kind, rows, cols) = matrix(m, name, e)?;
         // Actual memory address + byte length makes cache identity unique per mapped model.
         self.packed_matvec(
@@ -369,6 +453,42 @@ impl Backend for Vulkan {
             cols,
             x,
         )
+    }
+    fn forward_device(
+        &mut self,
+        m: &Gguf,
+        c: &Config,
+        token: u32,
+        pos: usize,
+        context: usize,
+        logits: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        if !self.graph_enabled {
+            return Ok(None);
+        }
+        self.select_model(m);
+        if self
+            .graph
+            .as_ref()
+            .map(|g| g.context != context)
+            .unwrap_or(true)
+        {
+            ensure!(
+                pos == 0,
+                "reset the model before changing Vulkan execution mode/context"
+            );
+            self.graph = Some(crate::gpu_graph::Graph::new(self, m, c, context)?);
+        }
+        let mut graph = self.graph.take().unwrap();
+        let result = graph.forward(self, m, c, token, pos, logits);
+        self.graph = Some(graph);
+        result.map(Some)
+    }
+    fn device_resident(&self) -> bool {
+        self.graph_enabled
+    }
+    fn metadata(&self) -> serde_json::Value {
+        serde_json::json!({"backend":"vulkan","adapter":self.adapter_name,"software":self.software,"resident":self.graph_enabled,"weight_cache_budget_bytes":self.budget,"kv_budget_bytes":self.kv_budget})
     }
     fn stats(&self) -> &Stats {
         &self.stats
