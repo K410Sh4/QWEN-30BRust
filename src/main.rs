@@ -9,7 +9,7 @@ use qwen_rust::{
 use std::{
     io::{self, Write},
     path::PathBuf,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Parser)]
@@ -50,12 +50,20 @@ struct Compute {
     /// Measure resident Vulkan stages with host timers and supported GPU timestamp queries.
     #[arg(long)]
     profile: bool,
+    /// Reuse mapped transfer buffers for resident expert uploads.
+    #[arg(long)]
+    staged_expert_uploads: bool,
 }
 impl Compute {
     fn backend(&self) -> Result<Box<dyn Backend>> {
         ensure!(
             !self.profile || matches!(self.device, Device::Vulkan) && !self.vulkan_reference,
             "--profile requires the resident Vulkan graph"
+        );
+        ensure!(
+            !self.staged_expert_uploads
+                || matches!(self.device, Device::Vulkan) && !self.vulkan_reference,
+            "--staged-expert-uploads requires the resident Vulkan graph"
         );
         Ok(match self.device {
             Device::Cpu => Box::new(Cpu::default()),
@@ -68,7 +76,8 @@ impl Compute {
                 )?
                 .reference(self.vulkan_reference)
                 .kv_budget_mib(self.gpu_kv_mib)?
-                .weight_reuse(!self.no_weight_reuse);
+                .weight_reuse(!self.no_weight_reuse)
+                .staged_expert_uploads(self.staged_expert_uploads);
                 eprintln!(
                     "Vulkan adapter: {} | software={} | execution={}",
                     v.adapter_name,
@@ -159,6 +168,12 @@ enum Command {
         compute: Compute,
     },
 }
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Devices => {
@@ -373,6 +388,7 @@ fn main() -> Result<()> {
                     "CPU RAM"
                 }
             );
+            let prefill_started_unix_ms = unix_ms();
             let start = Instant::now();
             let mut logits = Vec::new();
             for (id, &token) in ids.iter().enumerate() {
@@ -386,6 +402,7 @@ fn main() -> Result<()> {
             let prefill_seconds = start.elapsed().as_secs_f64();
             let prefill_stats = b.stats().clone();
             eprintln!();
+            let decode_started_unix_ms = unix_ms();
             let decode = Instant::now();
             let mut count = 0;
             let mut decode_steps = 0u64;
@@ -425,7 +442,7 @@ fn main() -> Result<()> {
             eprintln!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &serde_json::json!({"prompt_tokens":ids.len(),"generated_tokens":count,"prefill_seconds":prefill_seconds,"generation_seconds":decode.elapsed().as_secs_f64(),"time_to_first_token_seconds":first_token_seconds,"decode_forward_steps":decode_steps,"decode_forward_seconds":decode_forward_seconds,"decode_forward_tokens_per_second":if decode_forward_seconds>0.{Some(decode_steps as f64/decode_forward_seconds)}else{None},"prefill_stats":prefill_stats,"decode_stats":decode_stats,"decode_weight_upload_mib_per_step":if decode_steps>0{Some(decode_stats.uploaded_bytes as f64/1048576./decode_steps as f64)}else{None},"decode_weight_hit_rate_by_bytes":if decode_stats.weight_requested_bytes>0{Some(1.-decode_stats.uploaded_bytes as f64/decode_stats.weight_requested_bytes as f64)}else{None},"backend":b.metadata(),"stats":b.stats(),"note":"Wall timings include orchestration and transfers. The first generated token uses the last prefill logits. Sampling/printing are excluded only from decode_forward_seconds. Hardware speed is not implied by counters."})
+                    &serde_json::json!({"profile_window_unix_ms":{"prefill_start":prefill_started_unix_ms,"decode_start":decode_started_unix_ms,"decode_end":unix_ms()},"prompt_tokens":ids.len(),"generated_tokens":count,"prefill_seconds":prefill_seconds,"generation_seconds":decode.elapsed().as_secs_f64(),"time_to_first_token_seconds":first_token_seconds,"decode_forward_steps":decode_steps,"decode_forward_seconds":decode_forward_seconds,"decode_forward_tokens_per_second":if decode_forward_seconds>0.{Some(decode_steps as f64/decode_forward_seconds)}else{None},"prefill_stats":prefill_stats,"decode_stats":decode_stats,"decode_weight_upload_mib_per_step":if decode_steps>0{Some(decode_stats.uploaded_bytes as f64/1048576./decode_steps as f64)}else{None},"decode_weight_hit_rate_by_bytes":if decode_stats.weight_requested_bytes>0{Some(1.-decode_stats.uploaded_bytes as f64/decode_stats.weight_requested_bytes as f64)}else{None},"backend":b.metadata(),"stats":b.stats(),"note":"Wall timings include orchestration and transfers. The first generated token uses the last prefill logits. Sampling/printing are excluded only from decode_forward_seconds. Hardware speed is not implied by counters."})
                 )?
             );
         }

@@ -8,7 +8,10 @@ use std::{
     sync::{mpsc, Arc},
     time::Instant,
 };
-use wgpu::util::DeviceExt;
+use wgpu::util::{DeviceExt, StagingBelt};
+
+const STAGING_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
+const STAGING_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Default, Clone, Serialize, Debug)]
 pub struct Stats {
@@ -137,6 +140,8 @@ pub struct Vulkan {
     submitted_epoch: u64,
     completed_epoch: u64,
     reuse_weights: bool,
+    expert_staging: Option<StagingBelt>,
+    staging_pending_bytes: u64,
 }
 impl Vulkan {
     pub fn new(budget_mib: u64, filter: Option<&str>, allow_software: bool) -> Result<Self> {
@@ -230,6 +235,8 @@ impl Vulkan {
             submitted_epoch: 0,
             completed_epoch: 0,
             reuse_weights: true,
+            expert_staging: None,
+            staging_pending_bytes: 0,
         })
     }
     pub fn devices() -> Vec<String> {
@@ -285,7 +292,7 @@ impl Vulkan {
             }
             return Ok(output);
         }
-        let weights = self.upload_weight(key, data)?;
+        let weights = self.upload_weight(key, data, None)?;
         self.dispatch(&weights, kind, rows, cols, rb, x, start)
     }
     pub fn kv_budget_mib(mut self, mib: u64) -> Result<Self> {
@@ -312,15 +319,21 @@ impl Vulkan {
         self.reuse_weights = enabled;
         self
     }
+    /// Reuse mapped transfer buffers for resident expert uploads.
+    pub fn staged_expert_uploads(mut self, enabled: bool) -> Self {
+        self.expert_staging = enabled.then(|| StagingBelt::new(STAGING_CHUNK_BYTES));
+        self
+    }
     /// Uploads may recycle only buffers last used by an explicitly completed epoch.
     /// The key must uniquely identify immutable bytes within the selected model.
     pub(crate) fn upload_weight(
         &mut self,
         key: (usize, usize),
         data: &[u8],
+        encoder: Option<&mut wgpu::CommandEncoder>,
     ) -> Result<Arc<wgpu::Buffer>> {
         let started = Instant::now();
-        let result = self.upload_weight_inner(key, data);
+        let result = self.upload_weight_inner(key, data, encoder);
         self.stats.weight_prepare_ms += started.elapsed().as_secs_f64() * 1000.;
         result
     }
@@ -328,6 +341,7 @@ impl Vulkan {
         &mut self,
         key: (usize, usize),
         data: &[u8],
+        encoder: Option<&mut wgpu::CommandEncoder>,
     ) -> Result<Arc<wgpu::Buffer>> {
         self.clock += 1;
         let bytes = (data.len() as u64 + 3) & !3;
@@ -368,8 +382,12 @@ impl Vulkan {
         let packed = if data.len().is_multiple_of(4) {
             data
         } else {
+            let started = self.stats.profile.as_ref().map(|_| Instant::now());
             padded.extend_from_slice(data);
             padded.resize(bytes as usize, 0);
+            if let (Some(profile), Some(started)) = (&mut self.stats.profile, started) {
+                profile.host_weight_padding_ms += started.elapsed().as_secs_f64() * 1000.;
+            }
             &padded
         };
         let buffer = if let Some(buffer) = recycled {
@@ -377,18 +395,46 @@ impl Vulkan {
             buffer
         } else {
             self.stats.weight_buffer_allocations += 1;
-            Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
+            let started = self.stats.profile.as_ref().map(|_| Instant::now());
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("packed weights"),
                 size: bytes,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            }))
+            });
+            if let (Some(profile), Some(started)) = (&mut self.stats.profile, started) {
+                profile.host_weight_alloc_ms += started.elapsed().as_secs_f64() * 1000.;
+            }
+            Arc::new(buffer)
         };
-        // Queue writes execute before the next submit, hence the completed-epoch
-        // guard is essential: a pending encoder may still refer to an evicted tensor.
-        self.queue.write_buffer(&buffer, 0, packed);
+        let started = self.stats.profile.as_ref().map(|_| Instant::now());
+        let encoder = encoder.filter(|_| {
+            bytes <= STAGING_CHUNK_BYTES / 2
+                && self.staging_pending_bytes + bytes <= STAGING_BATCH_BYTES
+        });
+        if let (Some(belt), Some(encoder)) = (&mut self.expert_staging, encoder) {
+            belt.write_buffer(
+                encoder,
+                &buffer,
+                0,
+                wgpu::BufferSize::new(bytes).context("empty staging write")?,
+                &self.device,
+            )
+            .copy_from_slice(packed);
+            self.staging_pending_bytes += bytes;
+            if let Some(profile) = &mut self.stats.profile {
+                profile.expert_staged_bytes += bytes;
+            }
+        } else {
+            // Queue writes precede the next submit. A pending encoder may still
+            // reference an evicted tensor, so recycling requires a completed epoch.
+            self.queue.write_buffer(&buffer, 0, packed);
+        }
+        if let (Some(profile), Some(started)) = (&mut self.stats.profile, started) {
+            profile.host_weight_write_ms += started.elapsed().as_secs_f64() * 1000.;
+        }
         self.stats.uploaded_bytes += bytes;
         if bytes <= self.budget {
             self.used += bytes;
@@ -408,7 +454,14 @@ impl Vulkan {
     }
     pub(crate) fn submit_commands(&mut self, encoder: wgpu::CommandEncoder) {
         let started = self.stats.profile.as_ref().map(|_| Instant::now());
-        self.queue.submit(Some(encoder.finish()));
+        if let Some(belt) = &mut self.expert_staging {
+            belt.finish();
+            self.queue.submit(Some(encoder.finish()));
+            belt.recall();
+            self.staging_pending_bytes = 0;
+        } else {
+            self.queue.submit(Some(encoder.finish()));
+        }
         if let (Some(profile), Some(started)) = (&mut self.stats.profile, started) {
             profile.host_submit_ms += started.elapsed().as_secs_f64() * 1000.;
         }
@@ -585,14 +638,23 @@ impl Backend for Vulkan {
         }
         let mut graph = self.graph.take().unwrap();
         let result = graph.forward(self, m, c, token, pos, logits);
-        self.graph = Some(graph);
+        if result.is_err() && self.staging_pending_bytes > 0 {
+            // The failed encoder may have been dropped before submitting its uploads.
+            self.cache.clear();
+            self.lru.clear();
+            self.used = 0;
+            self.expert_staging = Some(StagingBelt::new(STAGING_CHUNK_BYTES));
+            self.staging_pending_bytes = 0;
+        } else {
+            self.graph = Some(graph);
+        }
         result.map(Some)
     }
     fn device_resident(&self) -> bool {
         self.graph_enabled
     }
     fn metadata(&self) -> serde_json::Value {
-        let mut metadata = serde_json::json!({"backend":"vulkan","adapter":self.adapter_name,"software":self.software,"resident":self.graph_enabled,"weight_cache_budget_bytes":self.budget,"kv_budget_bytes":self.kv_budget,"weight_buffer_reuse":self.reuse_weights});
+        let mut metadata = serde_json::json!({"backend":"vulkan","adapter":self.adapter_name,"software":self.software,"resident":self.graph_enabled,"weight_cache_budget_bytes":self.budget,"kv_budget_bytes":self.kv_budget,"weight_buffer_reuse":self.reuse_weights,"expert_staging":self.expert_staging.is_some()});
         if self.stats.profile.is_some() {
             metadata["gpu_timestamp_query"] = self
                 .device
@@ -629,7 +691,7 @@ mod recycling_tests {
         let a = vec![1f32; 150000];
         let b = vec![2f32; 150000];
         let c = vec![3f32; 150000];
-        let old = v.upload_weight((1, 1), bytemuck::cast_slice(&a)).unwrap();
+        let old = v.upload_weight((1, 1), bytemuck::cast_slice(&a), None).unwrap();
         let out = staging(&v, old.size());
         let mut encoder = v
             .device
@@ -637,14 +699,14 @@ mod recycling_tests {
         encoder.copy_buffer_to_buffer(&old, 0, &out, 0, old.size());
         drop(old);
         // Same-sized oldest buffer is still referenced by an unsubmitted copy.
-        let second = v.upload_weight((2, 2), bytemuck::cast_slice(&b)).unwrap();
+        let second = v.upload_weight((2, 2), bytemuck::cast_slice(&b), None).unwrap();
         drop(second);
         assert_eq!(v.stats.weight_buffer_allocations, 2);
         assert_eq!(v.stats.weight_buffer_reuses, 0);
         v.submit_commands(encoder);
         assert_eq!(v.read_buffer(&out).unwrap(), a);
         // Now B was uploaded by the completed submission and has no external owner.
-        let third = v.upload_weight((3, 3), bytemuck::cast_slice(&c)).unwrap();
+        let third = v.upload_weight((3, 3), bytemuck::cast_slice(&c), None).unwrap();
         assert_eq!(v.stats.weight_buffer_allocations, 2);
         assert_eq!(v.stats.weight_buffer_reuses, 1);
         let out = staging(&v, third.size());
@@ -660,7 +722,7 @@ mod recycling_tests {
     fn held_owner_and_size_mismatch_prevent_reuse() {
         let mut v = gpu();
         let a = vec![1f32; 150000];
-        let held = v.upload_weight((1, 1), bytemuck::cast_slice(&a)).unwrap();
+        let held = v.upload_weight((1, 1), bytemuck::cast_slice(&a), None).unwrap();
         let out = staging(&v, held.size());
         let mut encoder = v
             .device
@@ -668,7 +730,7 @@ mod recycling_tests {
         encoder.copy_buffer_to_buffer(&held, 0, &out, 0, held.size());
         v.submit_commands(encoder);
         v.read_buffer(&out).unwrap();
-        let second = v.upload_weight((2, 2), bytemuck::cast_slice(&a)).unwrap();
+        let second = v.upload_weight((2, 2), bytemuck::cast_slice(&a), None).unwrap();
         drop(second);
         assert_eq!(v.stats.weight_buffer_reuses, 0);
         drop(held);
@@ -679,7 +741,7 @@ mod recycling_tests {
         v.submit_commands(encoder);
         v.read_buffer(&out).unwrap();
         let b = vec![2f32; 160000];
-        v.upload_weight((3, 3), bytemuck::cast_slice(&b)).unwrap();
+        v.upload_weight((3, 3), bytemuck::cast_slice(&b), None).unwrap();
         assert_eq!(v.stats.weight_buffer_reuses, 0);
         assert_eq!(v.stats.weight_buffer_allocations, 3);
     }

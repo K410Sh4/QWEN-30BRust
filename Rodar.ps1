@@ -8,7 +8,9 @@ param(
     [switch]$Reference,
     [switch]$NoWeightReuse,
     [string]$Adapter = '',
-    [switch]$Profile
+    [switch]$Profile,
+    [switch]$StagedExpertUploads,
+    [string]$HardwareCsv = ''
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -37,7 +39,29 @@ try {
     if ($NoWeightReuse) { $runArgs += '--no-weight-reuse' }
     if ($Reference) { $runArgs += '--vulkan-reference' }
     if ($Profile) { $runArgs += '--profile' }
+    if ($StagedExpertUploads) { $runArgs += '--staged-expert-uploads' }
     if ($Adapter) { $runArgs += @('--adapter',$Adapter) }
-    & $exe @runArgs
-    if ($LASTEXITCODE -ne 0) { throw 'Falha na inferencia. Guarde a mensagem de erro para diagnostico.' }
+    $monitor = $null
+    try {
+        if ($HardwareCsv) {
+            $HardwareCsv = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($HardwareCsv)
+            if (Test-Path -LiteralPath $HardwareCsv) { throw "CSV ja existe: $HardwareCsv" }
+            $monitorScript = Join-Path $PSScriptRoot 'scripts\MedirHardware.ps1'
+            $monitor = Start-Job -FilePath $monitorScript -ArgumentList $Model,$HardwareCsv
+        }
+        & $exe @runArgs
+        if ($LASTEXITCODE -ne 0) { throw 'Falha na inferencia. Guarde a mensagem de erro para diagnostico.' }
+    } finally {
+        if ($monitor) {
+            Stop-Job -Job $monitor -ErrorAction SilentlyContinue
+            $monitorErrors = @()
+            Receive-Job -Job $monitor -ErrorAction SilentlyContinue -ErrorVariable monitorErrors | Out-Null
+            Remove-Job -Job $monitor
+            if ($monitorErrors -or -not (Test-Path -LiteralPath $HardwareCsv)) {
+                Write-Warning "A coleta de hardware ficou incompleta: $monitorErrors"
+            } else {
+                Write-Host "Telemetria de hardware: $HardwareCsv"
+            }
+        }
+    }
 } finally { Pop-Location }

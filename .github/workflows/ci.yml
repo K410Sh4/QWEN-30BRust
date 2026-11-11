@@ -42,6 +42,10 @@ jobs:
           $enginePath = Build-QwenEngine
           & $enginePath logits --model $modelPath --tokens 1,5 --ctx 8 --device cpu
           if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell helper smoke test failed' }
+          $csv = Join-Path $env:RUNNER_TEMP 'qwen-hardware-smoke.csv'
+          & .\scripts\MedirHardware.ps1 -ModelPath $modelPath -OutFile $csv -Samples 1
+          $sample = @(Import-Csv -LiteralPath $csv)
+          if ($sample.Count -ne 1 -or [int64]$sample[0].AvailableRamMiB -le 0) { throw 'Hardware CSV smoke test failed' }
   vulkan-software:
     runs-on: ubuntu-latest
     env:

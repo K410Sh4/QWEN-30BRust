@@ -318,7 +318,7 @@ impl Graph {
         for first in (0..rows).step_by(tile_rows) {
             let n = tile_rows.min(rows - first);
             let data = &data[first * rb..(first + n) * rb];
-            let w = v.upload_weight((data.as_ptr() as usize, data.len()), data)?;
+            let w = v.upload_weight((data.as_ptr() as usize, data.len()), data, None)?;
             Self::mm(
                 v,
                 e,
@@ -551,11 +551,15 @@ impl Graph {
                 .enumerate()
             {
                 let mut shape = [0; 8];
+                let name = format!("{base}.{name}.weight");
                 for (slot, &(expert, _)) in selected.iter().enumerate() {
-                    let (data, kind, rows, cols) =
-                        matrix(m, &format!("{base}.{name}.weight"), Some(expert))?;
+                    let (data, kind, rows, cols) = matrix(m, &name, Some(expert))?;
                     let stride = padded(data.len());
-                    let w = v.upload_weight((data.as_ptr() as usize, data.len()), data)?;
+                    let w = v.upload_weight(
+                        (data.as_ptr() as usize, data.len()),
+                        data,
+                        Some(&mut e),
+                    )?;
                     e.copy_buffer_to_buffer(
                         &w,
                         0,

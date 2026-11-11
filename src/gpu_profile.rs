@@ -16,6 +16,10 @@ pub struct ProfileStats {
     pub host_router_wait_ms: f64,
     pub host_logits_wait_ms: f64,
     pub host_profile_read_ms: f64,
+    pub host_weight_alloc_ms: f64,
+    pub host_weight_write_ms: f64,
+    pub host_weight_padding_ms: f64,
+    pub expert_staged_bytes: u64,
     pub expert_uploaded_bytes: u64,
     pub expert_bank_copy_bytes: u64,
 }
@@ -35,6 +39,10 @@ impl ProfileStats {
             host_router_wait_ms: self.host_router_wait_ms - before.host_router_wait_ms,
             host_logits_wait_ms: self.host_logits_wait_ms - before.host_logits_wait_ms,
             host_profile_read_ms: self.host_profile_read_ms - before.host_profile_read_ms,
+            host_weight_alloc_ms: self.host_weight_alloc_ms - before.host_weight_alloc_ms,
+            host_weight_write_ms: self.host_weight_write_ms - before.host_weight_write_ms,
+            host_weight_padding_ms: self.host_weight_padding_ms - before.host_weight_padding_ms,
+            expert_staged_bytes: self.expert_staged_bytes - before.expert_staged_bytes,
             expert_uploaded_bytes: self.expert_uploaded_bytes - before.expert_uploaded_bytes,
             expert_bank_copy_bytes: self.expert_bank_copy_bytes - before.expert_bank_copy_bytes,
         }

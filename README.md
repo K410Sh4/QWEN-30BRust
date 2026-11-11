@@ -71,6 +71,21 @@ Os intervalos Vulkan usam o relógio da GPU. A espera na CPU pode incluir esses 
 
 Se `backend.gpu_timestamp_query` for `false`, o perfil da CPU continua disponível e `gpu_timestamp_steps` fica zero. O modo de diagnóstico acrescenta a leitura de timestamps e pode sincronizar o final dos tokens intermediários do prompt. `host_profile_read_ms` mede a chamada de leitura, que também pode esperar trabalho pendente. Os contadores de submissões e readbacks continuam contando apenas o caminho de inferência. Rode sem `-Profile` para comparar tokens/s.
 
+### Comparar uploads e monitorar o hardware no Windows
+
+Rode na mesma pasta, com o mesmo GGUF, prompt, contexto e orçamento de pesos. Use nomes diferentes para os CSVs de novas rodadas.
+
+```powershell
+.\Rodar.ps1 -Adapter '5700' -Context 4096 -GpuCacheMiB 4096 -MaxTokens 32 -Prompt 'Explique ownership em Rust.' -Profile -HardwareCsv 'hardware-base.csv'
+.\Rodar.ps1 -Adapter '5700' -Context 4096 -GpuCacheMiB 4096 -MaxTokens 32 -Prompt 'Explique ownership em Rust.' -Profile -HardwareCsv 'hardware-staging.csv' -StagedExpertUploads
+```
+
+- `host_weight_alloc_ms` mede a chamada que cria buffers de destino. `host_weight_write_ms` mede a preparação do envio na CPU e inclui os acessos às páginas mapeadas do GGUF durante a cópia. `host_weight_padding_ms` mede a cópia para alinhar pesos quando necessária. `weight_prepare_ms` inclui também o trabalho do cache. Esses tempos de host não isolam o tempo de PCIe.
+- `-StagedExpertUploads` reutiliza buffers de transferência em blocos de 4 MiB, com até 32 MiB de dados preparados por submissão. `expert_staged_bytes` mede quantos bytes passaram por esse caminho. Em modo experimental, `gpu_expert_copies_ms` inclui também essas transferências registradas no encoder. Compare tempo total e uploads nos dois modos. Repita em ordem invertida para reduzir a influência do cache de arquivos do Windows.
+- O CSV amostra leituras do volume do GGUF, leituras totais dos volumes, RAM disponível, memória comprometida e leituras de páginas do Windows. Compare `UnixMsUtc` com `profile_window_unix_ms` no JSON. São contadores de volume e do sistema, que também incluem outros processos. O CSV não altera parâmetros de hardware ou do Windows.
+
+Depois do A/B, mantenha o caminho mais rápido e teste o orçamento de pesos separadamente. Em 4096 de contexto, o KV reserva 768 MiB. Se os prompts e respostas couberem em 1024, o KV reserva 192 MiB. Monitore o uso de memória dedicada e compartilhada ao ajustar o cache de pesos na RX 5700 XT. Se a RAM disponível cair enquanto as leituras de páginas e do volume sobem na fase de preparo, compare uma rodada com os demais programas pesados fechados antes de decidir sobre RAM ou SSD.
+
 ## Antes e depois
 
 | Aspecto | Referência com execução da v0.1 | Residente 0.2 |

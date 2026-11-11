@@ -304,3 +304,37 @@ fn stage_profiling_preserves_logits_and_inference_counters() {
         assert_eq!(profile.gpu_timestamp_steps, 0);
     }
 }
+
+#[test]
+#[ignore = "requires Vulkan; checks staged expert uploads under cache pressure"]
+fn staged_expert_uploads_preserve_logits_and_cache_counters() {
+    use qwen_rust::backend::{Backend, Vulkan};
+
+    let allow = std::env::var("QWEN_TEST_ALLOW_SOFTWARE").as_deref() == Ok("1");
+    let run = |staged| {
+        let mut gpu = Vulkan::new_with_profile(0, None, allow, true)
+            .unwrap()
+            .staged_expert_uploads(staged);
+        let mut model = Model::new(Gguf::open(&fixture()).unwrap(), 8).unwrap();
+        model.forward_without_logits(1, &mut gpu).unwrap();
+        model.forward_without_logits(5, &mut gpu).unwrap();
+        let logits = model.forward(2, &mut gpu).unwrap();
+        (logits, gpu.stats().clone())
+    };
+    let (expected, baseline) = run(false);
+    let (actual, staged) = run(true);
+    assert!(
+        qwen_rust::benchmark::parity(&[expected], &[actual], 0.00002, 0.0002)
+            .unwrap()
+            .passed
+    );
+    assert_eq!(baseline.uploaded_bytes, staged.uploaded_bytes);
+    assert_eq!(baseline.cache_misses, staged.cache_misses);
+    assert_eq!(baseline.submissions, staged.submissions);
+    assert_eq!(baseline.readbacks, staged.readbacks);
+    let profile = staged.profile.unwrap();
+    assert!(profile.expert_staged_bytes > 0);
+    assert_eq!(profile.expert_staged_bytes, profile.expert_uploaded_bytes);
+    assert!(profile.host_weight_alloc_ms > 0.);
+    assert!(profile.host_weight_write_ms > 0.);
+}
