@@ -1,10 +1,5 @@
 pub use crate::gpu_profile::ProfileStats;
-use crate::{
-    gguf::Gguf,
-    gpu_profile::GpuProfile,
-    model::Config,
-    quant,
-};
+use crate::{gguf::Gguf, gpu_profile::GpuProfile, model::Config, quant};
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use std::{
@@ -576,7 +571,11 @@ impl Backend for Vulkan {
                 "reset the model before changing Vulkan execution mode/context"
             );
             let started = self.stats.profile.as_ref().map(|_| Instant::now());
-            if self.device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            if self
+                .device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY)
+            {
                 self.gpu_profile = Some(GpuProfile::new(&self.device, &self.queue, c.layers)?);
             }
             self.graph = Some(crate::gpu_graph::Graph::new(self, m, c, context)?);
@@ -595,8 +594,11 @@ impl Backend for Vulkan {
     fn metadata(&self) -> serde_json::Value {
         let mut metadata = serde_json::json!({"backend":"vulkan","adapter":self.adapter_name,"software":self.software,"resident":self.graph_enabled,"weight_cache_budget_bytes":self.budget,"kv_budget_bytes":self.kv_budget,"weight_buffer_reuse":self.reuse_weights});
         if self.stats.profile.is_some() {
-            metadata["gpu_timestamp_query"] =
-                self.device.features().contains(wgpu::Features::TIMESTAMP_QUERY).into();
+            metadata["gpu_timestamp_query"] = self
+                .device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY)
+                .into();
         }
         metadata
     }
