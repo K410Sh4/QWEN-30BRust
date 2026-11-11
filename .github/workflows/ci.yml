@@ -59,9 +59,23 @@ jobs:
       - run: python tools/reference_fixture.py --out test-output/dispatch --profile dispatch
       - name: Compare reference and resident execution
         run: target/release/qwen-rust bench --model test-output/dispatch/tiny-qwen3moe.gguf --tokens 1,5,2,9 --ctx 16 --gpu-cache-mib 128 --compare --warmup 1 --runs 3 --allow-software > test-output/dispatch-comparison.json
+      - name: Check weight-buffer reuse under cache pressure
+        run: |
+          target/release/qwen-rust bench --model test-output/dispatch/tiny-qwen3moe.gguf --tokens 1,5,2,9 --ctx 16 --gpu-cache-mib 4 --compare-weight-reuse --warmup 1 --runs 3 --allow-software > test-output/weight-reuse-comparison.json
+          python - <<'PY'
+          import json
+          r=json.load(open('test-output/weight-reuse-comparison.json'))
+          assert r['parity']['passed']
+          for a,b in zip(r['without_reuse']['measured_stats'],r['with_reuse']['measured_stats']):
+              for key in ['uploaded_bytes','cache_hits','cache_misses','cache_evictions','weight_requested_bytes']:
+                  assert a[key]==b[key],key
+              assert b['weight_buffer_reuses']>0
+              assert b['weight_buffer_allocations']<a['weight_buffer_allocations']
+          PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: software-vulkan-parity-and-comparison
           path: |
             test-output/parity-vulkan.json
             test-output/dispatch-comparison.json
+            test-output/weight-reuse-comparison.json

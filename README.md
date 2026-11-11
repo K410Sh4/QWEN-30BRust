@@ -1,8 +1,8 @@
-# QWEN-30BRust — 0.2.0
+# QWEN-30BRust — 0.2.1
 
 Motor de inferência próprio para Qwen3-Coder-30B-A3B, em Rust e Vulkan/WGSL, com os pesos treinados originais em GGUF. A versão 0.2 mantém as ativações e o cache KV na GPU e executa os especialistas em lote. Não depende de Ollama, llama.cpp ou PyTorch para inferência.
 
-**Estado:** experimental. A versão 0.1 foi executada pelo operador na RX 5700 XT e gerou texto. A versão 0.2 passou nos testes numéricos e no benchmark sintético com Vulkan por software; a velocidade do 30B real na Radeon precisa ser medida com `Benchmark.ps1`. Consulte [VALIDACAO.md](VALIDACAO.md) para resultados e limitações.
+**Estado:** experimental. A versão 0.2.1 acrescenta reciclagem segura de buffers de pesos e diagnóstico dos tempos de upload/espera.  A versão 0.1 foi executada pelo operador na RX 5700 XT e gerou texto. A versão 0.2 passou nos testes numéricos e no benchmark sintético com Vulkan por software; a velocidade do 30B real na Radeon precisa ser medida com `Benchmark.ps1`. Consulte [VALIDACAO.md](VALIDACAO.md) para resultados e limitações.
 
 ## Executar no Windows
 
@@ -36,9 +36,17 @@ Para executar o caminho antigo como diagnóstico:
 
 O teste executa os modos de referência e residente, **um por vez**, com o mesmo arquivo, precisão FP32 e sequência explícita de tokens. Guarda `benchmark-result.json`, verifica todos os prefixos de logits e informa tokens/s, razão entre tempos, transferências, readbacks e alocações. O primeiro ciclo é reportado separado dos ciclos medidos. Um erro de paridade termina com código de falha; uma razão de velocidade não é garantia de correção.
 
+Para isolar o efeito da reciclagem sem mudar o grafo residente ou a política do cache:
+
+```powershell
+.\Benchmark.ps1 -Adapter '5700' -CompareWeightReuse -OutFile 'benchmark-weight-reuse.json'
+```
+
+Esse modo serializa reciclagem desligada/ligada, valida os logits e grava `without_reuse`/`with_reuse`. A comparação padrão de grafo mantém as chaves `reference`/`resident`. `Rodar.ps1 -NoWeightReuse` ou `--no-weight-reuse` na CLI desativa a reciclagem para diagnóstico. Reduzir alocações não garante melhorar tokens/s; a versão 0.2.1 não altera o tamanho do cache nem diminui os bytes transferidos para os mesmos acessos.
+
 É um teste de forward em prefixos fixos, não um benchmark de conversa natural nem de qualidade. Cache de páginas do sistema, ordem dos modos e estado do driver podem afetar o resultado; repita a medição. Para uma primeira comparação mais curta, use `-Runs 1 -Warmup 0`. O caminho de referência pode levar tempo.
 
-`Rodar.ps1` também reporta tempo até o primeiro token e `decode_forward_tokens_per_second`. Essa última métrica usa os forwards reais de geração e exclui amostragem/impressão; o primeiro token gerado usa os logits do último token do prompt e não conta como novo forward.
+`Rodar.ps1` inclui `decode_stats` separado de `prefill_stats`, bytes de pesos solicitados, alocações/reciclagens e tempos de parede de preparo de pesos e espera no readback. Esses tempos não são timestamps de kernels nem contadores de leitura de disco. Também reporta tempo até o primeiro token e `decode_forward_tokens_per_second`. Essa última métrica usa os forwards reais de geração e exclui amostragem/impressão; o primeiro token gerado usa os logits do último token do prompt e não conta como novo forward.
 
 ## Antes e depois
 

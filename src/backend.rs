@@ -23,6 +23,11 @@ pub struct Stats {
     pub cache_evictions: u64,
     pub workspace_allocations: u64,
     pub device_forward_ms: f64,
+    pub weight_requested_bytes: u64,
+    pub weight_buffer_allocations: u64,
+    pub weight_buffer_reuses: u64,
+    pub weight_prepare_ms: f64,
+    pub gpu_readback_wait_ms: f64,
 }
 pub trait Backend {
     fn matvec(
@@ -107,6 +112,7 @@ pub(crate) struct Cached {
     buffer: Arc<wgpu::Buffer>,
     bytes: u64,
     age: u64,
+    last_use_epoch: u64,
 }
 pub struct Vulkan {
     pub(crate) device: wgpu::Device,
@@ -124,6 +130,9 @@ pub struct Vulkan {
     pub(crate) graph: Option<crate::gpu_graph::Graph>,
     pub(crate) graph_enabled: bool,
     pub(crate) kv_budget: u64,
+    submitted_epoch: u64,
+    completed_epoch: u64,
+    reuse_weights: bool,
 }
 impl Vulkan {
     pub fn new(budget_mib: u64, filter: Option<&str>, allow_software: bool) -> Result<Self> {
@@ -195,6 +204,9 @@ impl Vulkan {
             graph: None,
             graph_enabled: true,
             kv_budget: 1024 * 1024 * 1024,
+            submitted_epoch: 0,
+            completed_epoch: 0,
+            reuse_weights: true,
         })
     }
     pub fn devices() -> Vec<String> {
@@ -272,15 +284,37 @@ impl Vulkan {
             self.active_model = m.id;
         }
     }
+    /// Diagnostic A/B toggle. Recycling never changes cache keys or eviction policy.
+    pub fn weight_reuse(mut self, enabled: bool) -> Self {
+        self.reuse_weights = enabled;
+        self
+    }
+    /// Uploads may recycle only buffers last used by an explicitly completed epoch.
     /// The key must uniquely identify immutable bytes within the selected model.
     pub(crate) fn upload_weight(
         &mut self,
         key: (usize, usize),
         data: &[u8],
     ) -> Result<Arc<wgpu::Buffer>> {
+        let started = Instant::now();
+        let result = self.upload_weight_inner(key, data);
+        self.stats.weight_prepare_ms += started.elapsed().as_secs_f64() * 1000.;
+        result
+    }
+    fn upload_weight_inner(
+        &mut self,
+        key: (usize, usize),
+        data: &[u8],
+    ) -> Result<Arc<wgpu::Buffer>> {
         self.clock += 1;
+        let bytes = (data.len() as u64 + 3) & !3;
+        ensure!(bytes > 0, "empty packed weight buffer");
+        self.stats.weight_requested_bytes += bytes;
+        // The request can be recorded in an encoder that has not been submitted yet.
+        let next_epoch = self.submitted_epoch + 1;
         if let Some(cached) = self.cache.get_mut(&key) {
             cached.age = self.clock;
+            cached.last_use_epoch = next_epoch;
             self.stats.cache_hits += 1;
             self.lru.push(Reverse((self.clock, key)));
             let result = Arc::clone(&cached.buffer);
@@ -288,12 +322,23 @@ impl Vulkan {
             return Ok(result);
         }
         self.stats.cache_misses += 1;
-        let bytes = (data.len() as u64 + 3) & !3;
+        let mut recycled = None;
         while self.used + bytes > self.budget && !self.cache.is_empty() {
             let Reverse((age, k)) = self.lru.pop().context("LRU accounting invariant")?;
             if self.cache.get(&k).map(|c| c.age == age).unwrap_or(false) {
-                self.used -= self.cache.remove(&k).unwrap().bytes;
+                let old = self.cache.remove(&k).unwrap();
+                self.used -= old.bytes;
                 self.stats.cache_evictions += 1;
+                // Exact sizes keep budget accounting truthful. No additional free pool
+                // is retained, so recycling does not double the weight memory budget.
+                if self.reuse_weights
+                    && recycled.is_none()
+                    && old.bytes == bytes
+                    && old.last_use_epoch <= self.completed_epoch
+                    && Arc::strong_count(&old.buffer) == 1
+                {
+                    recycled = Some(old.buffer);
+                }
             }
         }
         let mut padded = Vec::new();
@@ -304,14 +349,23 @@ impl Vulkan {
             padded.resize(bytes as usize, 0);
             &padded
         };
-        let buffer = Arc::new(
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("packed weights"),
-                    contents: packed,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                }),
-        );
+        let buffer = if let Some(buffer) = recycled {
+            self.stats.weight_buffer_reuses += 1;
+            buffer
+        } else {
+            self.stats.weight_buffer_allocations += 1;
+            Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("packed weights"),
+                size: bytes,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_SRC
+                    | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }))
+        };
+        // Queue writes execute before the next submit, hence the completed-epoch
+        // guard is essential: a pending encoder may still refer to an evicted tensor.
+        self.queue.write_buffer(&buffer, 0, packed);
         self.stats.uploaded_bytes += bytes;
         if bytes <= self.budget {
             self.used += bytes;
@@ -321,12 +375,35 @@ impl Vulkan {
                     buffer: Arc::clone(&buffer),
                     bytes,
                     age: self.clock,
+                    last_use_epoch: next_epoch,
                 },
             );
             self.lru.push(Reverse((self.clock, key)));
         }
         self.compact_lru();
         Ok(buffer)
+    }
+    pub(crate) fn submit_commands(&mut self, encoder: wgpu::CommandEncoder) {
+        self.queue.submit(Some(encoder.finish()));
+        self.submitted_epoch += 1;
+        self.stats.submissions += 1;
+    }
+    pub(crate) fn read_buffer(&mut self, b: &wgpu::Buffer) -> Result<Vec<f32>> {
+        let started = Instant::now();
+        let slice = b.slice(..);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()??;
+        self.stats.gpu_readback_wait_ms += started.elapsed().as_secs_f64() * 1000.;
+        self.completed_epoch = self.submitted_epoch;
+        let values = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
+        b.unmap();
+        self.stats.readbacks += 1;
+        self.stats.readback_bytes += b.size();
+        Ok(values)
     }
     fn compact_lru(&mut self) {
         if self.lru.len() > self.cache.len() * 4 + 1024 {
@@ -421,20 +498,9 @@ impl Vulkan {
             pass.dispatch_workgroups(rows.min(65535) as u32, rows.div_ceil(65535) as u32, 1);
         }
         encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, (rows * 4) as u64);
-        self.queue.submit(Some(encoder.finish()));
-        self.stats.submissions += 1;
+        self.submit_commands(encoder);
         self.stats.gpu_dispatches += 1;
-        let slice = readback.slice(..);
-        let (tx, rx) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        self.device.poll(wgpu::Maintain::Wait);
-        rx.recv()??;
-        let values = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
-        readback.unmap();
-        self.stats.readbacks += 1;
-        self.stats.readback_bytes += (rows * 4) as u64;
+        let values = self.read_buffer(&readback)?;
         self.stats.matvecs += 1;
         self.stats.matvec_ms += start.elapsed().as_secs_f64() * 1000.;
         Ok(values)
@@ -488,9 +554,87 @@ impl Backend for Vulkan {
         self.graph_enabled
     }
     fn metadata(&self) -> serde_json::Value {
-        serde_json::json!({"backend":"vulkan","adapter":self.adapter_name,"software":self.software,"resident":self.graph_enabled,"weight_cache_budget_bytes":self.budget,"kv_budget_bytes":self.kv_budget})
+        serde_json::json!({"backend":"vulkan","adapter":self.adapter_name,"software":self.software,"resident":self.graph_enabled,"weight_cache_budget_bytes":self.budget,"kv_budget_bytes":self.kv_budget,"weight_buffer_reuse":self.reuse_weights})
     }
     fn stats(&self) -> &Stats {
         &self.stats
+    }
+}
+
+#[cfg(test)]
+mod recycling_tests {
+    use super::*;
+    fn gpu() -> Vulkan {
+        let allow = std::env::var("QWEN_TEST_ALLOW_SOFTWARE").as_deref() == Ok("1");
+        Vulkan::new(1, None, allow).unwrap()
+    }
+    fn staging(v: &Vulkan, bytes: u64) -> wgpu::Buffer {
+        v.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("epoch test readback"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+    }
+    #[test]
+    #[ignore = "requires Vulkan; pending encoder references must survive LRU eviction"]
+    fn recycle_only_after_completion() {
+        let mut v = gpu();
+        let a = vec![1f32; 150000];
+        let b = vec![2f32; 150000];
+        let c = vec![3f32; 150000];
+        let old = v.upload_weight((1, 1), bytemuck::cast_slice(&a)).unwrap();
+        let out = staging(&v, old.size());
+        let mut encoder = v
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&old, 0, &out, 0, old.size());
+        drop(old);
+        // Same-sized oldest buffer is still referenced by an unsubmitted copy.
+        let second = v.upload_weight((2, 2), bytemuck::cast_slice(&b)).unwrap();
+        drop(second);
+        assert_eq!(v.stats.weight_buffer_allocations, 2);
+        assert_eq!(v.stats.weight_buffer_reuses, 0);
+        v.submit_commands(encoder);
+        assert_eq!(v.read_buffer(&out).unwrap(), a);
+        // Now B was uploaded by the completed submission and has no external owner.
+        let third = v.upload_weight((3, 3), bytemuck::cast_slice(&c)).unwrap();
+        assert_eq!(v.stats.weight_buffer_allocations, 2);
+        assert_eq!(v.stats.weight_buffer_reuses, 1);
+        let out = staging(&v, third.size());
+        let mut encoder = v
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&third, 0, &out, 0, third.size());
+        v.submit_commands(encoder);
+        assert_eq!(v.read_buffer(&out).unwrap(), c);
+    }
+    #[test]
+    #[ignore = "requires Vulkan; externally held buffers cannot be recycled"]
+    fn held_owner_and_size_mismatch_prevent_reuse() {
+        let mut v = gpu();
+        let a = vec![1f32; 150000];
+        let held = v.upload_weight((1, 1), bytemuck::cast_slice(&a)).unwrap();
+        let out = staging(&v, held.size());
+        let mut encoder = v
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.copy_buffer_to_buffer(&held, 0, &out, 0, held.size());
+        v.submit_commands(encoder);
+        v.read_buffer(&out).unwrap();
+        let second = v.upload_weight((2, 2), bytemuck::cast_slice(&a)).unwrap();
+        drop(second);
+        assert_eq!(v.stats.weight_buffer_reuses, 0);
+        drop(held);
+        // Complete B, then request a different capacity. No hidden oversize pool.
+        let encoder = v
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        v.submit_commands(encoder);
+        v.read_buffer(&out).unwrap();
+        let b = vec![2f32; 160000];
+        v.upload_weight((3, 3), bytemuck::cast_slice(&b)).unwrap();
+        assert_eq!(v.stats.weight_buffer_reuses, 0);
+        assert_eq!(v.stats.weight_buffer_allocations, 3);
     }
 }

@@ -1,16 +1,22 @@
-# Otimização e contrato de medição — 0.2
+# Otimização e contrato de medição — 0.2.1
 
 ## Implementado sem aproximações adicionais
 
 1. **Estado residente:** cada token entra com a linha de embedding; ativações e KV ficam na GPU. Por camada, a CPU recebe apenas os 128 logits do router, escolhe os oito especialistas e providencia seus pesos. Ao final, recebe os logits do vocabulário. O lote de especialistas e a atenção seguinte compartilham o mesmo encoder até a próxima decisão de roteamento.
 2. **Especialistas em lote:** cópias entre buffers GPU juntam os pesos selecionados em três bancos reutilizáveis. Gate/up/down usam a dimensão Z do dispatch para oito especialistas. Os resultados são combinados na GPU com as probabilidades renormalizadas.
 3. **Precisão:** normalizações, atenção, KV e ativações permanecem FP32. Os pesos continuam na quantização do arquivo original. A ordem paralela das somas pode alterar números; asserções usam tolerâncias, não igualdade binária.
-4. **Alocações:** buffers de trabalho e uniformes de formato persistem. Os parâmetros de posição são escritos uma vez por token. Misses do cache de pesos ainda podem alocar buffers; não há promessa de zero alocações totais.
+4. **Alocações:** buffers de trabalho e uniformes de formato persistem. Os parâmetros de posição são escritos uma vez por token. Misses do cache de pesos podem reciclar o buffer expulso de mesma capacidade, após confirmação de conclusão GPU e sem outro proprietário Rust. Nos outros casos alocam normalmente; não há promessa de zero alocações totais.
 5. **LRU:** heap de idades com verificação de entradas antigas e compactação. A contabilidade cobre os buffers no cache. Comandos já submetidos podem manter recursos expulsos vivos até terminarem; o orçamento não é um limite rígido de consumo total da GPU.
 6. **Prefill:** as projeções de vocabulário e readbacks finais são omitidos nos tokens intermediários. O último token produz os logits necessários à geração. As camadas de atenção ainda são processadas sequencialmente token a token.
 7. **Amostragem:** greedy usa busca linear; top-k usa seleção parcial. O subconjunto final mantém a ordenação e a mesma sequência pseudoaleatória da referência.
 
 O `Model` exige reset antes de alternar entre KV na CPU e KV residente; recusa a troca em uma sequência ativa para evitar histórico incompleto.
+
+## Segurança da reciclagem de pesos
+
+Um write da queue é executado antes dos comandos da próxima submission. Reutilizar um buffer ainda referenciado por um encoder pendente poderia trocar os pesos antes de sua leitura. Cada acesso recebe o epoch da próxima submission; um buffer expulso só é reciclado quando seu último epoch está explicitamente concluído por um readback síncrono. Uma referência `Arc` externa também impede reciclagem.
+
+A capacidade deve ser exatamente igual. Não há lista extra de buffers livres: apenas um buffer sendo expulso pode ser reaproveitado no mesmo miss. A política LRU, os hits/misses, os bytes enviados e os pesos permanecem iguais. As alocações internas de staging do wgpu/driver continuam fora desse contador.
 
 ## Contadores
 
@@ -21,12 +27,18 @@ O `Model` exige reset antes de alternar entre KV na CPU e KV residente; recusa a
 | `submissions` | Chamadas explícitas a `queue.submit`; uploads podem gerar trabalho adicional dentro do wgpu. |
 | `readbacks` / `readback_bytes` | Mapeamentos síncronos de staging para a CPU e bytes solicitados. |
 | `uploaded_bytes` | Bytes de pesos compactados enviados por misses do cache, com padding. Não inclui embedding, uniformes ou rates. |
+| `weight_requested_bytes` | Bytes compactados solicitados ao cache, incluindo hits e padding. Permite calcular taxa de acerto por bytes. |
+| `weight_buffer_allocations/reuses` | Novos buffers GPU de pesos e buffers expulsos reciclados. Não inclui staging interno. |
+| `weight_prepare_ms` | Tempo de parede da rotina de cache/upload: inclui busca, alocação e cópia para staging. Pode incluir page faults e chamadas do driver; não identifica o SSD. |
+| `gpu_readback_wait_ms` | Tempo bloqueado em map/poll/recebimento do readback. Inclui espera de GPU/transferência/escalonamento, sem ser tempo puro de kernels. |
 | `cache_hits/misses/evictions` | Eventos do cache de pesos. Não são leituras do SSD nem page faults do SO. |
 | `workspace_allocations` | Buffers de trabalho/normas/uniformes criados explicitamente pelo código. Exclui pesos e alocações internas do driver/wgpu. |
 | `matvec_ms` | Tempo de parede de matvec no caminho de referência; inclui espera e transferências. Zero no grafo residente. |
 | `device_forward_ms` | Tempo de parede do token no grafo residente; inclui roteamento CPU e transferências. Não é tempo puro dos kernels. |
 
 No 30B de 48 camadas/top-8, com tensores cabendo nos limites por binding e solicitando logits: 1393 matrizes lógicas, 385 dispatches de matvec e 529 operações vetoriais/atenção = 914 dispatches no modo residente. Há 49 submissions explícitas e 49 readbacks. O modo referência usa 1393 submissions/readbacks. O prefill intermediário residente mantém 49 submissions, executa 48 readbacks e omite a normalização/projeção final do vocabulário. Tiling e configurações diferentes alteram esses números.
+
+Os temporizadores de preparo e readback medem trechos de CPU dentro do forward. A GPU pode executar assincronamente; esses valores não constituem um perfil de duração dos kernels. O chat separa `decode_stats` dos contadores de prefill e calcula upload por passo e hit rate por bytes.
 
 ## O que continua limitando o desempenho
 

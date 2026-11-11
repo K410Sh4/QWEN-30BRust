@@ -8,7 +8,7 @@ use crate::{
     ops, quant,
 };
 use anyhow::{ensure, Context, Result};
-use std::{collections::HashMap, sync::mpsc, time::Instant};
+use std::{collections::HashMap, time::Instant};
 use wgpu::util::DeviceExt;
 
 struct Layer {
@@ -341,22 +341,10 @@ impl Graph {
         Ok(())
     }
     fn submit(v: &mut Vulkan, e: wgpu::CommandEncoder) {
-        v.queue.submit(Some(e.finish()));
-        v.stats.submissions += 1;
+        v.submit_commands(e);
     }
     fn read(v: &mut Vulkan, b: &wgpu::Buffer) -> Result<Vec<f32>> {
-        let slice = b.slice(..);
-        let (tx, rx) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
-        v.device.poll(wgpu::Maintain::Wait);
-        rx.recv()??;
-        let values = bytemuck::cast_slice::<u8, f32>(&slice.get_mapped_range()).to_vec();
-        b.unmap();
-        v.stats.readbacks += 1;
-        v.stats.readback_bytes += b.size();
-        Ok(values)
+        v.read_buffer(b)
     }
     pub fn forward(
         &mut self,

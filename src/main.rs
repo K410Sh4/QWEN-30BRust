@@ -44,6 +44,9 @@ struct Compute {
     /// Maximum memory for FP32 GPU KV values (separate from the weight cache).
     #[arg(long, default_value_t = 1024)]
     gpu_kv_mib: u64,
+    /// Diagnostic: allocate fresh weight buffers on cache misses.
+    #[arg(long)]
+    no_weight_reuse: bool,
 }
 impl Compute {
     fn backend(&self) -> Result<Box<dyn Backend>> {
@@ -56,7 +59,8 @@ impl Compute {
                     self.allow_software,
                 )?
                 .reference(self.vulkan_reference)
-                .kv_budget_mib(self.gpu_kv_mib)?;
+                .kv_budget_mib(self.gpu_kv_mib)?
+                .weight_reuse(!self.no_weight_reuse);
                 eprintln!(
                     "Vulkan adapter: {} | software={} | execution={}",
                     v.adapter_name,
@@ -108,6 +112,9 @@ enum Command {
         runs: usize,
         #[arg(long)]
         compare: bool,
+        /// Same resident graph and cache policy; compare buffer recycling off/on.
+        #[arg(long, conflicts_with = "compare")]
+        compare_weight_reuse: bool,
         #[arg(long, default_value_t = 0.0005)]
         atol: f32,
         #[arg(long, default_value_t = 0.0005)]
@@ -193,6 +200,7 @@ fn main() -> Result<()> {
             warmup,
             runs,
             compare,
+            compare_weight_reuse,
             atol,
             rtol,
             mut compute,
@@ -209,28 +217,40 @@ fn main() -> Result<()> {
                 atol.is_finite() && atol >= 0. && rtol.is_finite() && rtol >= 0.,
                 "invalid parity tolerances"
             );
-            if compare {
+            if compare || compare_weight_reuse {
                 ensure!(
                     matches!(compute.device, Device::Vulkan),
                     "--compare requires --device vulkan"
                 );
-                compute.vulkan_reference = true;
+                if compare_weight_reuse {
+                    ensure!(
+                        !compute.vulkan_reference,
+                        "weight-reuse comparison requires the resident graph"
+                    );
+                    compute.no_weight_reuse = true;
+                } else {
+                    compute.vulkan_reference = true;
+                }
                 let (reference, expected) =
                     qwen_rust::benchmark::run(&model, &tokens, ctx, warmup, runs, || {
                         compute.backend()
                     })?;
-                compute.vulkan_reference = false;
+                if compare_weight_reuse {
+                    compute.no_weight_reuse = false;
+                } else {
+                    compute.vulkan_reference = false;
+                }
                 let (resident, actual) =
                     qwen_rust::benchmark::run(&model, &tokens, ctx, warmup, runs, || {
                         compute.backend()
                     })?;
                 let parity = qwen_rust::benchmark::parity(&expected, &actual, atol, rtol)?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &serde_json::json!({"reference":reference,"resident":resident,"reference_over_resident_ratio":reference.median_seconds/resident.median_seconds,"parity":parity,"note":"Fixed token prefixes, serialized modes, same weights/precision. OS page cache and driver state may affect results. Software Vulkan results are not a Radeon benchmark."})
-                    )?
-                );
+                let report = if compare_weight_reuse {
+                    serde_json::json!({"comparison":"weight_buffer_reuse","without_reuse":reference,"with_reuse":resident,"without_over_with_ratio":reference.median_seconds/resident.median_seconds,"parity":parity,"note":"Same resident graph, precision, token prefixes and cache policy. Only safe completed-buffer recycling changes. OS page cache and driver state can affect wall timings."})
+                } else {
+                    serde_json::json!({"comparison":"execution_graph","reference":reference,"resident":resident,"reference_over_resident_ratio":reference.median_seconds/resident.median_seconds,"parity":parity,"note":"Fixed token prefixes, serialized modes, same weights/precision. OS page cache and driver state may affect results. Software Vulkan results are not a Radeon benchmark."})
+                };
+                println!("{}", serde_json::to_string_pretty(&report)?);
                 ensure!(parity.passed,"resident logits exceeded parity tolerance; do not interpret throughput as a validated improvement");
             } else {
                 let (report, _) =
@@ -393,10 +413,11 @@ fn main() -> Result<()> {
                 }
             }
             println!();
+            let decode_stats = qwen_rust::benchmark::delta(b.stats(), &prefill_stats);
             eprintln!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &serde_json::json!({"prompt_tokens":ids.len(),"generated_tokens":count,"prefill_seconds":prefill_seconds,"generation_seconds":decode.elapsed().as_secs_f64(),"time_to_first_token_seconds":first_token_seconds,"decode_forward_steps":decode_steps,"decode_forward_seconds":decode_forward_seconds,"decode_forward_tokens_per_second":if decode_forward_seconds>0.{Some(decode_steps as f64/decode_forward_seconds)}else{None},"prefill_stats":prefill_stats,"backend":b.metadata(),"stats":b.stats(),"note":"Wall timings include orchestration and transfers. The first generated token uses the last prefill logits. Sampling/printing are excluded only from decode_forward_seconds. Hardware speed is not implied by counters."})
+                    &serde_json::json!({"prompt_tokens":ids.len(),"generated_tokens":count,"prefill_seconds":prefill_seconds,"generation_seconds":decode.elapsed().as_secs_f64(),"time_to_first_token_seconds":first_token_seconds,"decode_forward_steps":decode_steps,"decode_forward_seconds":decode_forward_seconds,"decode_forward_tokens_per_second":if decode_forward_seconds>0.{Some(decode_steps as f64/decode_forward_seconds)}else{None},"prefill_stats":prefill_stats,"decode_stats":decode_stats,"decode_weight_upload_mib_per_step":if decode_steps>0{Some(decode_stats.uploaded_bytes as f64/1048576./decode_steps as f64)}else{None},"decode_weight_hit_rate_by_bytes":if decode_stats.weight_requested_bytes>0{Some(1.-decode_stats.uploaded_bytes as f64/decode_stats.weight_requested_bytes as f64)}else{None},"backend":b.metadata(),"stats":b.stats(),"note":"Wall timings include orchestration and transfers. The first generated token uses the last prefill logits. Sampling/printing are excluded only from decode_forward_seconds. Hardware speed is not implied by counters."})
                 )?
             );
         }

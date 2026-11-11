@@ -23,7 +23,7 @@ pub struct Report {
     pub median_seconds: f64,
     pub forward_tokens_per_second: f64,
 }
-fn delta(a: &Stats, b: &Stats) -> Stats {
+pub fn delta(a: &Stats, b: &Stats) -> Stats {
     Stats {
         matvecs: a.matvecs - b.matvecs,
         uploaded_bytes: a.uploaded_bytes - b.uploaded_bytes,
@@ -37,6 +37,11 @@ fn delta(a: &Stats, b: &Stats) -> Stats {
         cache_evictions: a.cache_evictions - b.cache_evictions,
         workspace_allocations: a.workspace_allocations - b.workspace_allocations,
         device_forward_ms: a.device_forward_ms - b.device_forward_ms,
+        weight_requested_bytes: a.weight_requested_bytes - b.weight_requested_bytes,
+        weight_buffer_allocations: a.weight_buffer_allocations - b.weight_buffer_allocations,
+        weight_buffer_reuses: a.weight_buffer_reuses - b.weight_buffer_reuses,
+        weight_prepare_ms: a.weight_prepare_ms - b.weight_prepare_ms,
+        gpu_readback_wait_ms: a.gpu_readback_wait_ms - b.gpu_readback_wait_ms,
     }
 }
 pub fn run<F>(

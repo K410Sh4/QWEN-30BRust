@@ -6,6 +6,7 @@ param(
     [int]$GpuCacheMiB = 4096,
     [int]$GpuKvMiB = 1024,
     [switch]$Reference,
+    [switch]$NoWeightReuse,
     [string]$Adapter = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -32,6 +33,7 @@ try {
     }
     if ((Get-FileHash -LiteralPath $tokenizerPath -Algorithm SHA256).Hash -ne $expectedHash) { throw 'Tokenizer local difere da versao oficial fixada. Use a CLI com --tokenizer para outra versao compativel.' }
     $runArgs = @('chat','--model',$Model,'--tokenizer',$tokenizerPath,'--prompt',$Prompt,'--ctx',"$Context",'--max-tokens',"$MaxTokens",'--gpu-cache-mib',"$GpuCacheMiB",'--device','vulkan','--gpu-kv-mib',"$GpuKvMiB")
+    if ($NoWeightReuse) { $runArgs += '--no-weight-reuse' }
     if ($Reference) { $runArgs += '--vulkan-reference' }
     if ($Adapter) { $runArgs += @('--adapter',$Adapter) }
     & $exe @runArgs
