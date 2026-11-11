@@ -17,6 +17,23 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Smoke test hardware collection in Windows PowerShell 5.1
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $csv = Join-Path $env:RUNNER_TEMP 'qwen-hardware-smoke.csv'
+          $modelPath = (Resolve-Path 'tests\data\tiny-qwen3moe.gguf').Path
+          $script = (Resolve-Path 'scripts\MedirHardware.ps1').Path
+          $job = Start-Job -FilePath $script -ArgumentList $modelPath,$csv,1
+          try {
+            $job | Wait-Job -Timeout 30 | Out-Null
+            Receive-Job -Job $job
+            if ($job.State -ne 'Completed') { throw "Hardware collector job state: $($job.State)" }
+          } finally {
+            Remove-Job -Job $job -Force
+          }
+          $sample = @(Import-Csv -LiteralPath $csv)
+          if ($sample.Count -ne 1 -or [int64]$sample[0].AvailableRamMiB -le 0) { throw 'Hardware CSV smoke test failed' }
       - run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
       - run: rustup default stable
       - run: cargo fmt --check
@@ -42,10 +59,6 @@ jobs:
           $enginePath = Build-QwenEngine
           & $enginePath logits --model $modelPath --tokens 1,5 --ctx 8 --device cpu
           if ($LASTEXITCODE -ne 0) { throw 'Windows PowerShell helper smoke test failed' }
-          $csv = Join-Path $env:RUNNER_TEMP 'qwen-hardware-smoke.csv'
-          & .\scripts\MedirHardware.ps1 -ModelPath $modelPath -OutFile $csv -Samples 1
-          $sample = @(Import-Csv -LiteralPath $csv)
-          if ($sample.Count -ne 1 -or [int64]$sample[0].AvailableRamMiB -le 0) { throw 'Hardware CSV smoke test failed' }
   vulkan-software:
     runs-on: ubuntu-latest
     env:

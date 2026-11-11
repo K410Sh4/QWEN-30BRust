@@ -14,6 +14,8 @@ for ($sample = 0; $Samples -eq 0 -or $sample -lt $Samples; $sample++) {
     $disks = @(Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_LogicalDisk)
     $modelDisk = $disks | Where-Object { $_.Name -eq $volume } | Select-Object -First 1
     $totalDisk = $disks | Where-Object { $_.Name -eq '_Total' } | Select-Object -First 1
+    $modelReadBytes = if ($modelDisk) { $modelDisk.DiskReadBytesPersec }
+    $totalReadBytes = if ($totalDisk) { $totalDisk.DiskReadBytesPersec }
     [pscustomobject]@{
         UnixMsUtc = $now
         ModelVolume = $volume
@@ -21,8 +23,8 @@ for ($sample = 0; $Samples -eq 0 -or $sample -lt $Samples; $sample++) {
         CommittedBytes = $memory.CommittedBytes
         CommitLimitBytes = $memory.CommitLimit
         PageReadsPerSec = $memory.PageReadsPersec
-        ModelVolumeReadBytesPerSec = if ($modelDisk) { $modelDisk.DiskReadBytesPersec }
-        AllVolumesReadBytesPerSec = if ($totalDisk) { $totalDisk.DiskReadBytesPersec }
+        ModelVolumeReadBytesPerSec = $modelReadBytes
+        AllVolumesReadBytesPerSec = $totalReadBytes
     } | Export-Csv -LiteralPath $OutFile -NoTypeInformation -Append -Encoding UTF8
     if ($Samples -eq 0 -or $sample + 1 -lt $Samples) { Start-Sleep -Seconds 1 }
 }
